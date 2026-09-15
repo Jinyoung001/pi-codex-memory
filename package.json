@@ -1,14 +1,27 @@
 {
   "name": "pi-codex-memory",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Codex-style two-phase memory pipeline for pi: background extraction from past sessions, consolidation into MEMORY.md + memory_summary.md, injected into every turn",
   "type": "module",
   "main": "index.ts",
-  "keywords": ["pi", "pi-package", "pi-coding-agent", "memory", "codex", "agent-memory"],
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-coding-agent",
+    "memory",
+    "codex",
+    "agent-memory"
+  ],
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
-  "files": ["index.ts", "prompts", "README.md"],
+  "files": [
+    "index.ts",
+    "prompts",
+    "README.md"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",

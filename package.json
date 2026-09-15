@@ -1,7 +1,7 @@
 {
   "name": "pi-codex-memory",
-  "version": "0.1.1",
-  "description": "Codex-style two-phase memory pipeline for pi: background extraction from past sessions, consolidation into MEMORY.md + memory_summary.md, injected into every turn",
+  "version": "0.2.0",
+  "description": "Port of OpenAI Codex memories (two-phase extraction + consolidation, SQLite jobs, git-baseline workspace, read-path injection, citations) for the pi coding agent",
   "type": "module",
   "main": "index.ts",
   "keywords": [
@@ -19,10 +19,18 @@
   },
   "files": [
     "index.ts",
+    "safety.js",
+    "src",
     "prompts",
+    "vendor/codex/LICENSE",
+    "vendor/codex/NOTICE",
+    "vendor/codex/MEMORIES.md",
+    "vendor/codex/reference.json",
+    "THIRD_PARTY_NOTICES.md",
+    "CODEX_PARITY.md",
     "README.md"
   ],
-  "license": "MIT",
+  "license": "(MIT AND Apache-2.0)",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Jinyoung001/pi-codex-memory.git"
@@ -32,7 +40,8 @@
   },
   "scripts": {
     "check": "tsc -p tsconfig.json",
-    "prepublishOnly": "npm run check"
+    "test": "node --experimental-strip-types --no-warnings --test test/*.test.mjs",
+    "prepublishOnly": "npm run check && npm test"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.85.0"

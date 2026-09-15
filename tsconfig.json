@@ -4,9 +4,18 @@
     "moduleResolution": "NodeNext",
     "target": "ES2022",
     "strict": true,
+    "allowJs": true,
     "noEmit": true,
     "skipLibCheck": true,
-    "types": ["node"]
+    "types": [
+      "node"
+    ],
+    "allowImportingTsExtensions": true
   },
-  "files": ["index.ts"]
+  "files": [
+    "index.ts"
+  ],
+  "include": [
+    "src/**/*.ts"
+  ]
 }

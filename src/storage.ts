@@ -1,0 +1,136 @@
+// Filesystem artifacts. Mirrors codex memories/write/src/storage.rs + extensions/{ad_hoc,prune}.rs.
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { atomicWrite } from "../safety.js";
+import { EXTENSION_RESOURCES } from "./config.ts";
+import type { Stage1Output } from "./store.ts";
+
+export const rolloutSummariesDir = (root: string) => path.join(root, "rollout_summaries");
+export const extensionsRoot = (root: string) => path.join(root, "extensions");
+export const rawMemoriesFile = (root: string) => path.join(root, "raw_memories.md");
+export const adHocNotesDir = (root: string) => path.join(extensionsRoot(root), "ad_hoc", "notes");
+
+export function ensureLayout(root: string) {
+  fs.mkdirSync(root, { recursive: true });
+  if (fs.lstatSync(root).isSymbolicLink()) throw new Error(`memory root cannot be a symbolic link: ${root}`);
+  removeMemorySymlinks(root);
+  fs.mkdirSync(rolloutSummariesDir(root), { recursive: true });
+}
+
+/** Codex removes every symlink under the memory root (workspace.rs remove_memory_symlinks). Returns count. */
+export function removeMemorySymlinks(root: string): number {
+  let removed = 0;
+  const stack = [root];
+  while (stack.length) {
+    const dir = stack.pop()!;
+    if (path.basename(dir) === ".git") continue;
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isSymbolicLink()) { fs.rmSync(p, { force: true, recursive: false }); removed++; }
+      else if (e.isDirectory()) stack.push(p);
+    }
+  }
+  return removed;
+}
+
+// ---- ad-hoc extension (seeded instructions, note lifecycle) ----
+export function seedExtensionInstructions(root: string, instructions: string) {
+  const dir = path.join(extensionsRoot(root), "ad_hoc");
+  fs.mkdirSync(dir, { recursive: true });
+  const f = path.join(dir, "instructions.md");
+  try { fs.writeFileSync(f, instructions, { flag: "wx" }); } catch (e: any) { if (e.code !== "EEXIST") throw e; }
+}
+
+/** Codex prunes `extensions/<ext>/resources/*` older than RETENTION_DAYS by filename timestamp. Notes are never deleted. */
+export function pruneOldExtensionResources(root: string, nowMs = Date.now()) {
+  const cutoff = nowMs - EXTENSION_RESOURCES.RETENTION_DAYS * 86400e3;
+  const ext = extensionsRoot(root);
+  if (!fs.existsSync(ext)) return;
+  for (const e of fs.readdirSync(ext, { withFileTypes: true })) {
+    if (!e.isDirectory() || !fs.existsSync(path.join(ext, e.name, "instructions.md"))) continue;
+    const res = path.join(ext, e.name, "resources");
+    if (!fs.existsSync(res)) continue;
+    for (const f of fs.readdirSync(res)) {
+      const m = f.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})/);
+      if (!m) continue;
+      const ts = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+      if (ts < cutoff) fs.rmSync(path.join(res, f), { force: true });
+    }
+  }
+}
+
+// ---- rollout summaries + raw_memories.md ----
+const SHORT_HASH_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const SHORT_HASH_SPACE = 14_776_336; // 62^4
+
+function fmtTs(ms: number) { return new Date(ms).toISOString().slice(0, 19).replace(/:/g, "-"); }
+
+/** Port of rollout_summary_file_stem_from_parts. UUIDv7 timestamp when parseable, else source_updated_at. */
+export function rolloutSummaryFileStem(threadId: string, sourceUpdatedAtSec: number, slug: string | null): string {
+  let tsMs = sourceUpdatedAtSec * 1000, seed = 0;
+  const hex = threadId.replace(/-/g, "");
+  if (/^[0-9a-f]{32}$/i.test(hex)) {
+    if (hex[12] === "7") tsMs = parseInt(hex.slice(0, 12), 16);           // uuid v7 → unix ms
+    seed = parseInt(hex.slice(24, 32), 16) >>> 0;                            // low 32 bits
+  } else {
+    for (const b of Buffer.from(threadId)) seed = (Math.imul(seed, 31) + b) >>> 0;
+  }
+  let v = seed % SHORT_HASH_SPACE;
+  const chars = ["0", "0", "0", "0"];
+  for (let i = 3; i >= 0; i--) { chars[i] = SHORT_HASH_ALPHABET[v % 62]; v = Math.floor(v / 62); }
+  const prefix = `${fmtTs(tsMs)}-${chars.join("")}`;
+  if (!slug) return prefix;
+  let s = "";
+  for (const ch of slug) { if (s.length >= 60) break; s += /[a-zA-Z0-9]/.test(ch) ? ch.toLowerCase() : "_"; }
+  s = s.replace(/_+$/, "");
+  return s ? `${prefix}-${s}` : prefix;
+}
+
+export const stemOf = (m: Stage1Output) => rolloutSummaryFileStem(m.threadId, m.sourceUpdatedAt, m.rolloutSlug);
+
+export function syncRolloutSummaries(root: string, memories: Stage1Output[]) {
+  ensureLayout(root);
+  const dir = rolloutSummariesDir(root);
+  const keep = new Set(memories.map(stemOf));
+  for (const f of fs.readdirSync(dir)) {
+    if (!f.endsWith(".md")) continue;
+    if (!keep.has(f.slice(0, -3))) fs.rmSync(path.join(dir, f), { force: true });
+  }
+  for (const m of memories) {
+    const body = [
+      `thread_id: ${m.threadId}`,
+      `updated_at: ${new Date(m.sourceUpdatedAt * 1000).toISOString()}`,
+      `rollout_path: ${m.rolloutPath}`,
+      `cwd: ${m.cwd}`,
+      ...(m.gitBranch ? [`git_branch: ${m.gitBranch}`] : []),
+      "", m.rolloutSummary, "",
+    ].join("\n");
+    const p = path.join(dir, `${stemOf(m)}.md`);
+    if (!fs.existsSync(p) || fs.readFileSync(p, "utf8") !== body) atomicWrite(p, body);
+  }
+}
+
+export function rebuildRawMemoriesFile(root: string, memories: Stage1Output[]) {
+  let body = "# Raw Memories\n\n";
+  if (!memories.length) body += "No raw memories yet.\n";
+  else {
+    body += "Merged stage-1 raw memories (stable ascending thread-id order):\n\n";
+    for (const m of memories) {
+      body += `## Thread \`${m.threadId}\`\nupdated_at: ${new Date(m.sourceUpdatedAt * 1000).toISOString()}\ncwd: ${m.cwd}\nrollout_path: ${m.rolloutPath}\nrollout_summary_file: ${stemOf(m)}.md\n\n${m.rawMemory.trim()}\n\n`;
+    }
+  }
+  const p = rawMemoriesFile(root);
+  if (!fs.existsSync(p) || fs.readFileSync(p, "utf8") !== body) atomicWrite(p, body);
+}
+
+/** workspace.rs validate_consolidation_artifacts (V1). */
+export function validateConsolidationArtifacts(root: string) {
+  const removed = removeMemorySymlinks(root);
+  if (removed) throw new Error(`removed ${removed} symbolic links from consolidated memory workspace`);
+  const mem = path.join(root, "MEMORY.md");
+  if (!fs.existsSync(mem) || !fs.statSync(mem).isFile()) throw new Error(`consolidated memory artifact missing: ${mem}`);
+  const sum = path.join(root, "memory_summary.md");
+  if (!fs.existsSync(sum)) throw new Error(`memory summary artifact missing: ${sum}`);
+  const first = fs.readFileSync(sum, "utf8").split(/\r?\n/, 1)[0];
+  if (first !== "v1") throw new Error(`memory summary artifact does not start with v1: ${sum}`);
+}

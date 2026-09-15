@@ -1,5 +1,9 @@
 # pi-codex-memory
 
+```bash
+pi install npm:pi-codex-memory
+```
+
 Codex-style two-phase memory for pi. Port of `openai/codex` `codex-rs/memories` pipeline; prompts in `prompts/` are the upstream originals (stage_one_system.md, stage_one_input.md, consolidation.md) with a runtime adaptation appended for single-shot JSON output.
 
 ## Flow

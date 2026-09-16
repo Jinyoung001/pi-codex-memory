@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { runPiConsolidationSession } from "./consolidation-session.ts";
 import { STAGE2, WORKSPACE_DIFF, type MemoriesConfig } from "./config.ts";
-import { resolveMemoryModel, type Llm } from "./llm.ts";
+import { resolveMemoryModel, type Llm, type MemoryModel } from "./llm.ts";
 import { extensionsRoot, pruneOldExtensionResources, rebuildRawMemoriesFile, removeMemorySymlinks, syncRolloutSummaries, validateConsolidationArtifacts } from "./storage.ts";
 import { memoryWorkspaceDiff, prepareMemoryWorkspace, resetMemoryWorkspaceBaseline, writeWorkspaceDiff } from "./workspace.ts";
 import type { MemoryStore, Stage1Output } from "./store.ts";
@@ -91,7 +91,7 @@ export async function run(store: MemoryStore, cfg: MemoriesConfig, llm: Llm, roo
   try { guarded(() => prepareMemoryWorkspace(root)); } catch (e) { return fail(`prepare_workspace: ${(e as Error).message}`); }
 
   // 3. Agent config: model must resolve before we mutate anything.
-  let model: ReturnType<typeof resolveMemoryModel>['model'];
+  let model: MemoryModel;
   try { const selection=resolveMemoryModel(llm,cfg.consolidation_model); model=selection.model; store.setSetting("runtime:consolidation",JSON.stringify({model:`${model.provider}/${model.id}`,selection:selection.selection,reason:selection.reason})); } catch (e) { return fail(`agent_config: ${(e as Error).message}`); }
 
   // 4. Load inputs.
@@ -116,7 +116,7 @@ export async function run(store: MemoryStore, cfg: MemoriesConfig, llm: Llm, roo
   try { guarded(() => writeWorkspaceDiff(root, diff)); } catch (e) { return fail(`workspace_diff_file: ${(e as Error).message}`); }
 
   // 8+9. Run agent with heartbeats.
-  const hb = setInterval(() => { try { if (!store.heartbeatGlobalPhase2Job(token, STAGE2.JOB_LEASE_SECONDS)) { report("phase2: lost lease during heartbeat"); ac.abort(); } } catch (e) { report(`phase2: heartbeat failed: ${String(e)}`); ac.abort(); } }, STAGE2.JOB_HEARTBEAT_SECONDS * 1000);
+  const hb = setInterval(() => { try { if (!store.heartbeatGlobalPhase2Job(token, STAGE2.JOB_LEASE_SECONDS)) { report("phase2: lost lease during heartbeat"); ac.abort(new Error('lost_ownership')); } } catch (e) { report(`phase2: heartbeat failed: ${String(e)}`); ac.abort(new Error('lost_ownership')); } }, STAGE2.JOB_HEARTBEAT_SECONDS * 1000);
   const ac = new AbortController();
   const onAbort = () => ac.abort(); opts.signal?.addEventListener("abort", onAbort);
   if (opts.signal?.aborted) ac.abort();
@@ -126,7 +126,8 @@ export async function run(store: MemoryStore, cfg: MemoriesConfig, llm: Llm, roo
     completed = r.completed; agentError = r.error ?? "";
   } catch (e) { agentError = e instanceof Error ? e.message : String(e); }
   finally { clearInterval(hb); opts.signal?.removeEventListener("abort", onAbort); }
-  if (opts.signal?.aborted || ac.signal.aborted) return fail('aborted');
+  if (ac.signal.aborted && !opts.signal?.aborted) return fail('lost_ownership');
+  if (opts.signal?.aborted) { try { removeMemorySymlinks(root); } catch {} return fail('aborted'); } // lease still owned: keep no-symlink invariant
 
   if (!completed) { try { guarded(() => removeMemorySymlinks(root)); } catch {} return fail(`agent: ${agentError || "did not complete"}`); }
   try { guarded(() => validateConsolidationArtifacts(root, cfg.version)); } catch (e) { return fail(`invalid_artifacts: ${(e as Error).message}`); }
@@ -137,6 +138,6 @@ export async function run(store: MemoryStore, cfg: MemoriesConfig, llm: Llm, roo
   } catch (e) { return fail(e instanceof Error ? e.message : String(e)); }
 }
 
-async function runConsolidationAgent(llm: Llm, model: ReturnType<typeof resolveMemoryModel>['model'], cfg: MemoriesConfig, root: string, log: Log, signal: AbortSignal, onProgress: ((s: string) => void) | undefined, guarded: <T>(fn: () => T) => T): Promise<{ completed: boolean; error?: string }> {
+async function runConsolidationAgent(llm: Llm, model: MemoryModel, cfg: MemoriesConfig, root: string, log: Log, signal: AbortSignal, onProgress: ((s: string) => void) | undefined, guarded: <T>(fn: () => T) => T): Promise<{ completed: boolean; error?: string }> {
   return runPiConsolidationSession(llm,model,cfg,root,buildConsolidationPrompt(root,cfg.version)+HARNESS_NOTE(root),`Begin. Read ${WORKSPACE_DIFF.FILENAME} first.`,signal,guarded,onProgress);
 }

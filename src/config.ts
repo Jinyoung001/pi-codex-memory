@@ -57,7 +57,7 @@ export const DEFAULTS: MemoriesConfig = {
 };
 
 // Codex constants (memories/write/src/lib.rs)
-export const STAGE1 = { CONCURRENCY_LIMIT: 8, JOB_LEASE_SECONDS: 3600, JOB_RETRY_DELAY_SECONDS: 3600, THREAD_SCAN_LIMIT: 5000, PRUNE_BATCH_SIZE: 200, DEFAULT_ROLLOUT_TOKEN_LIMIT: 150_000, CONTEXT_WINDOW_PERCENT: 70 };
+export const STAGE1 = { CONCURRENCY_LIMIT: 8, JOB_LEASE_SECONDS: 3600, JOB_HEARTBEAT_SECONDS: 90, REQUEST_TIMEOUT_SECONDS: 55 * 60, JOB_RETRY_DELAY_SECONDS: 3600, THREAD_SCAN_LIMIT: 5000, PRUNE_BATCH_SIZE: 200, DEFAULT_ROLLOUT_TOKEN_LIMIT: 150_000, CONTEXT_WINDOW_PERCENT: 70 };
 export const STAGE2 = { JOB_LEASE_SECONDS: 3600, JOB_RETRY_DELAY_SECONDS: 3600, JOB_HEARTBEAT_SECONDS: 90 };
 export const WORKSPACE_DIFF = { FILENAME: "phase2_workspace_diff.md", MAX_BYTES: 4 * 1024 * 1024 };
 export const EXTENSION_RESOURCES = { RETENTION_DAYS: 7 };
@@ -101,8 +101,10 @@ function validateConfig(raw: Record<string, unknown>): MemoriesConfig {
   return cfg;
 }
 
+const withConfigLock = <T>(fn: () => T): T => withFileLock(CONFIG_FILE + '.lock', fn);
+
 export function saveConfig(patch: Partial<MemoriesConfig>) {
-  return withFileLock(CONFIG_FILE + '.lock', () => {
+  return withConfigLock(() => {
     const merged = { ...readConfigObject(), ...patch };
     validateConfig(merged);
     atomicWrite(CONFIG_FILE, JSON.stringify(merged, null, 2) + "\n");
@@ -110,22 +112,22 @@ export function saveConfig(patch: Partial<MemoriesConfig>) {
 }
 
 export function migrateLegacyConfig(): string[] {
-  return withFileLock(CONFIG_FILE + '.lock', () => {
-  const raw = readConfigObject();
-  const removed = ["consolidation_max_turns","profile","recall_max_bytes","recall_max_tokens","recall_semantic","core_max_tokens","memory_auto_tidy","memory_daily_calls"].filter(k => Object.hasOwn(raw,k));
-  if (!removed.length) return [];
-  let backup = CONFIG_FILE + ".before-codex-only.bak";
-  for(let i=1;fs.existsSync(backup);i++)backup=CONFIG_FILE+`.before-codex-only.${i}.bak`;
-  fs.copyFileSync(CONFIG_FILE,backup,fs.constants.COPYFILE_EXCL);
-  for (const k of removed) delete raw[k];
-  atomicWrite(CONFIG_FILE,JSON.stringify(raw,null,2)+"\n");
-  return removed;
+  return withConfigLock(() => {
+    const raw = readConfigObject();
+    const removed = ["consolidation_max_turns","profile","recall_max_bytes","recall_max_tokens","recall_semantic","core_max_tokens","memory_auto_tidy","memory_daily_calls"].filter(k => Object.hasOwn(raw,k));
+    if (!removed.length) return [];
+    let backup = CONFIG_FILE + ".before-codex-only.bak";
+    for(let i=1;fs.existsSync(backup);i++)backup=CONFIG_FILE+`.before-codex-only.${i}.bak`;
+    fs.copyFileSync(CONFIG_FILE,backup,fs.constants.COPYFILE_EXCL);
+    for (const k of removed) delete raw[k];
+    atomicWrite(CONFIG_FILE,JSON.stringify(raw,null,2)+"\n");
+    return removed;
   });
 }
 
 export function ensureConfigFile() {
-  withFileLock(CONFIG_FILE + '.lock', () => {
-    try { fs.writeFileSync(CONFIG_FILE, JSON.stringify(DEFAULTS, null, 2) + '\n', { flag: 'wx', mode: 0o600 }); }
-    catch (e) { if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e; }
+  withConfigLock(() => {
+    // Lock serialises writers; atomicWrite keeps unlocked readers from seeing a partial file.
+    if (!fs.existsSync(CONFIG_FILE)) atomicWrite(CONFIG_FILE, JSON.stringify(DEFAULTS, null, 2) + '\n');
   });
 }

@@ -33,7 +33,7 @@ function baselineUsable(root: string): boolean {
 }
 
 const ownedMarker = 'pi-codex-memory-owned';
-const paths = ['.', ':(exclude).git*', ':(exclude).memory-*', `:(exclude)${WORKSPACE_DIFF.FILENAME}`];
+const paths = ['.', ':(exclude).git*', ':(exclude).memory-*', ':(exclude)*.tmp', `:(exclude)${WORKSPACE_DIFF.FILENAME}`];
 function validateRepository(root: string, gitDir = path.join(root, '.git')) {
   assertTrustedPath(root);
   const stack = [gitDir];
@@ -51,11 +51,12 @@ function validateRepository(root: string, gitDir = path.join(root, '.git')) {
   }
   const marker = path.join(gitDir, ownedMarker);
   if (fs.existsSync(marker)) {
-    if (fs.readFileSync(marker, 'utf8') !== fs.realpathSync(root)) throw new Error('foreign memory baseline');
+    if (fs.readFileSync(marker, 'utf8') !== fs.realpathSync(root)) throw new Error(`foreign memory baseline (remove ${gitDir} to re-initialise)`);
   } else {
     // Adopt only the exact single-commit baseline produced by versions <= 0.2.1.
-    const identity = git(root, ['log', '-1', '--format=%an%n%ae%n%s'], { gitDir }).stdout.trim();
-    if (identity !== 'pi-codex-memory\nmemory@localhost\nmemory baseline' || git(root, ['rev-list', '--count', 'HEAD'], { gitDir }).stdout.trim() !== '1') throw new Error('repository is not an owned memory baseline');
+    const identity = git(root, ['log', '-1', '--format=%an%n%ae%n%s'], { gitDir, allowFail: true });
+    const count = git(root, ['rev-list', '--count', 'HEAD'], { gitDir, allowFail: true });
+    if (identity.status !== 0 || count.status !== 0 || identity.stdout.trim() !== 'pi-codex-memory\nmemory@localhost\nmemory baseline' || count.stdout.trim() !== '1') throw new Error(`repository is not an owned memory baseline (remove ${gitDir} to re-initialise)`);
     fs.writeFileSync(marker, fs.realpathSync(root), { flag: 'wx' });
   }
 }
@@ -63,7 +64,9 @@ function validateRepository(root: string, gitDir = path.join(root, '.git')) {
 function initBaseline(root: string) {
   const current = path.join(root, '.git'), next = path.join(root, '.git-next'), previous = path.join(root, '.git-previous');
   if (fs.existsSync(current)) validateRepository(root);
-  if (fs.existsSync(next) || fs.existsSync(previous)) throw new Error('unfinished baseline replacement; preserve .git-next/.git-previous for recovery');
+  // .git-next is always a throwaway; .git-previous is only needed when .git itself is missing.
+  if (fs.existsSync(next)) fs.rmSync(next, { recursive: true });
+  if (fs.existsSync(previous)) { if (fs.existsSync(current)) fs.rmSync(previous, { recursive: true }); else throw new Error('unfinished baseline replacement; move .git-previous back to .git to recover'); }
   let moved = false;
   try {
     git(root, ['init', '-q', '--template='], { gitDir: next });
@@ -111,11 +114,11 @@ export function memoryWorkspaceDiff(root: string): BaselineDiff {
   }
   if (!changes.length) return { changes, unifiedDiff: '' };
   // A child drains Git stdout while retaining only the bounded prefix. No giant parent buffer.
-  const script = `const {spawn}=require('node:child_process');let input='';process.stdin.on('data',d=>input+=d);process.stdin.on('end',()=>{const {args,limit}=JSON.parse(input);const p=spawn('git',args);let chunks=[],size=0,truncated=false,error='';p.stdout.on('data',b=>{const n=Math.min(b.length,limit-size);if(n)chunks.push(b.subarray(0,n));size+=n;if(n<b.length)truncated=true;});p.stderr.on('data',b=>{error=(error+b).slice(0,4096);});p.on('error',e=>{process.stderr.write(e.message);process.exitCode=1;});p.on('close',code=>{if(code!==0){process.stderr.write(error);process.exitCode=1;}else process.stdout.write(JSON.stringify({text:Buffer.concat(chunks).toString('utf8'),truncated}));});});`;
+  const script = `const {spawn}=require('node:child_process');let input='';process.stdin.on('data',d=>input+=d);process.stdin.on('end',()=>{const {args,limit}=JSON.parse(input);const p=spawn('git',args);let chunks=[],size=0,truncated=false,error='';p.stdout.on('data',b=>{const n=Math.min(b.length,limit-size);if(n)chunks.push(b.subarray(0,n));size+=n;if(n<b.length)truncated=true;});p.stderr.on('data',b=>{error=(error+b).slice(0,4096);});process.on('SIGTERM',()=>{p.kill();process.exit(1);});p.on('error',e=>{process.stderr.write(e.message);process.exitCode=1;});p.on('close',code=>{if(code!==0){process.stderr.write(error);process.exitCode=1;}else process.stdout.write(JSON.stringify({text:Buffer.concat(chunks).toString('utf8'),truncated}));});});`;
   const result = spawnSync(process.execPath, ['-e', script], { cwd: root, env: gitEnv(), input: JSON.stringify({ args: ['--git-dir', path.join(root, '.git'), '--work-tree', root, ...IDENT, 'diff', '--no-color', '--no-ext-diff', '--no-textconv', 'HEAD', '--', ...paths], limit: WORKSPACE_DIFF.MAX_BYTES }), encoding: 'utf8', timeout: 120000, maxBuffer: WORKSPACE_DIFF.MAX_BYTES * 6 + 65536 });
-  if (result.error || result.status !== 0) throw result.error ?? new Error(result.stderr);
+  if (result.error || result.status !== 0) throw result.error ?? new Error(`git diff helper failed (status ${result.status ?? result.signal}): ${(result.stderr ?? '').trim()}`);
   const captured: { text: string; truncated: boolean } = JSON.parse(result.stdout);
-  return { changes, unifiedDiff: captured.text.replace(/\uFFFD+$/, ''), diffTruncated: captured.truncated };
+  return { changes, unifiedDiff: captured.truncated ? captured.text.replace(/\uFFFD+$/, '') : captured.text, diffTruncated: captured.truncated };
 }
 
 export function renderWorkspaceDiffFile(diff: BaselineDiff): string {

@@ -37,7 +37,6 @@ export function resolveModel(l: Llm, spec: string | null) {
   return m;
 }
 
-export type Msg = CompletionContext['messages'][number];
 
 export async function complete(l: Llm, model: MemoryModel, ctx: CompletionContext, thinking: Thinking, signal?: AbortSignal, sessionId = randomUUID(), version?: "v1" | "v2") {
   const res = await l.registry.complete(model, ctx, { reasoningEffort: thinking === "off" ? undefined : thinking, sessionId, signal,
@@ -46,6 +45,5 @@ export async function complete(l: Llm, model: MemoryModel, ctx: CompletionContex
 }
 
 export const textOf = (msg: Completion): string => msg.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
-export const toolCallsOf = (msg: Completion) => msg.content.filter(c => c.type === 'toolCall');
 
 export function usageOf(msg: Completion) { return msg.usage ?? { input: 0, output: 0, totalTokens: 0, cost: { total: 0 } }; }

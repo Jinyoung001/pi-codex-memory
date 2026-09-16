@@ -256,7 +256,7 @@ INSERT OR IGNORE INTO consolidation_progress(singleton) VALUES(1);
   }
 
   releaseStage1Job(threadId: string, token: string): boolean {
-    return this.db.prepare(`UPDATE jobs SET status='pending', lease_until=NULL, ownership_token=NULL, retry_at=NULL WHERE kind=? AND job_key=? AND status='running' AND ownership_token=?`).run(JOB_STAGE1, threadId, token).changes > 0;
+    return this.db.prepare(`UPDATE jobs SET status='pending', worker_id=NULL, started_at=NULL, lease_until=NULL, ownership_token=NULL, retry_at=NULL WHERE kind=? AND job_key=? AND status='running' AND ownership_token=?`).run(JOB_STAGE1, threadId, token).changes > 0;
   }
 
   deleteThreadMemory(threadId: string) {

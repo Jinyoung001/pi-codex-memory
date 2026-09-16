@@ -4,10 +4,13 @@ import { randomUUID } from 'node:crypto';
 
 /** Pathname checks require trusted ancestors; they are not an OS sandbox. */
 export function assertTrustedPath(target) {
+  // Resolved chain: symlinked tmp/home ancestors (macOS /var -> /private/var) are not a memory-root escape.
   let current = path.resolve(target);
+  try { if (fs.lstatSync(current).isSymbolicLink()) throw new Error('symlink in memory path'); current = fs.realpathSync(current); }
+  catch (e) { if (e.code !== 'ENOENT') throw e; }
   while (true) {
-    try { if (fs.lstatSync(current).isSymbolicLink()) throw new Error('symlink (symbolic link) in memory path'); }
-    catch (e) { if (e.code !== 'ENOENT') throw e; }
+    try { if (fs.lstatSync(current).isSymbolicLink()) throw new Error('symlink in memory path'); }
+    catch (e) { if (e.code !== 'ENOENT' && e.code !== 'EACCES' && e.code !== 'EPERM') throw e; }
     const parent = path.dirname(current);
     if (parent === current) break;
     current = parent;
@@ -22,14 +25,24 @@ export function assertTrustedPath(target) {
  */
 export function withFileLock(file, fn) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const fd = fs.openSync(file, 'wx', 0o600);
+  let fd;
+  try { fd = fs.openSync(file, 'wx', 0o600); }
+  catch (e) {
+    if (e.code === 'EEXIST') throw new Error(`Lock file exists: ${file}. Another process may be writing; if none is running, remove the lock file and retry.`, { cause: e });
+    throw e;
+  }
   try { return fn(); }
-  finally { try { fs.closeSync(fd); } finally { fs.unlinkSync(file); } }
+  finally {
+    try { fs.closeSync(fd); } catch { /* best effort */ }
+    try { fs.unlinkSync(file); } catch { /* best effort; stale lock reported on next acquire */ }
+  }
 }
 
 /** Bound allocation and reject hard links using the actual opened descriptor. */
 export function readBounded(file, maxBytes = 8 * 1024 * 1024) {
-  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  const pre = fs.lstatSync(file);
+  if (!pre.isFile()) throw new Error('not a single-link regular file'); // also rejects symlinks where O_NOFOLLOW is unavailable (Windows) and FIFOs that would block open
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
   try {
     const st = fs.fstatSync(fd);
     if (!st.isFile() || st.nlink > 1) throw new Error('not a single-link regular file');
@@ -37,7 +50,7 @@ export function readBounded(file, maxBytes = 8 * 1024 * 1024) {
     const bytes = Buffer.alloc(Math.min(st.size + 1, maxBytes + 1));
     let used = 0, n;
     while (used < bytes.length && (n = fs.readSync(fd, bytes, used, bytes.length - used, null))) used += n;
-    if (used > maxBytes || used > st.size) throw new Error('file changed or exceeded input limit');
+    if (used > maxBytes || used !== st.size) throw new Error('file changed or exceeded input limit');
     return bytes.subarray(0, used);
   } finally { fs.closeSync(fd); }
 }
@@ -70,7 +83,7 @@ export function memoryPath(root, name) {
   let current = base;
   for (const segment of relative.split(path.sep)) {
     current = path.join(current, segment);
-    if (fs.lstatSync(current).isSymbolicLink()) throw new Error('Symlink in memory path');
+    if (fs.lstatSync(current).isSymbolicLink()) throw new Error('symlink in memory path');
   }
   if (!fs.statSync(target).isFile()) throw new Error('Memory path is not a file');
   return target;
@@ -80,13 +93,13 @@ export function memoryPath(root, name) {
 export function markdownFiles(root, dir = '') {
   assertTrustedPath(root);
   const out = [];
-  if (path.isAbsolute(dir) || dir.includes(':') || dir.split(/[\\/]/).includes('..')) throw new Error('Invalid memory directory');
+  if (path.isAbsolute(dir) || dir.includes(':') || dir.split(/[\\/]/).some(s => s === '..' || (s.startsWith('.') && s !== '.'))) throw new Error('Invalid memory directory');
   if (!fs.existsSync(root)) return out;
-  if (fs.lstatSync(root).isSymbolicLink()) throw new Error('Symlink in memory path');
+  if (fs.lstatSync(root).isSymbolicLink()) throw new Error('symlink in memory path');
   let current = root;
   for (const segment of dir.split(/[\\/]/).filter(Boolean)) {
     current = path.join(current, segment);
-    if (fs.lstatSync(current).isSymbolicLink()) throw new Error('Symlink in memory path');
+    if (fs.lstatSync(current).isSymbolicLink()) throw new Error('symlink in memory path');
   }
   for (const entry of fs.readdirSync(path.join(root, dir), { withFileTypes: true })) {
     if (entry.name.startsWith('.') || entry.isSymbolicLink()) continue;
@@ -102,7 +115,8 @@ export function redact(text) {
   // Pinned codex-secrets sanitizer order and replacement text.
   return text
     .replace(/\bBearer[ \t]+[A-Za-z0-9._~+/-]{16,}=*/gi, 'Bearer [REDACTED_SECRET]')
-    .replace(/sk-[A-Za-z0-9_-]{20,}/g, '[REDACTED_SECRET]')
+    // Diverges from upstream: `_`/`-` for sk-proj keys; anchored so kebab identifiers (task-, flask-) survive.
+    .replace(/\bsk-[A-Za-z0-9_-]{20,}/g, '[REDACTED_SECRET]')
     .replace(/\bAKIA[0-9A-Z]{16}\b/g, '[REDACTED_SECRET]')
     .replace(/\b(api[_-]?key|token|secret|password)\b(\s*[:=]\s*)(["']?)[^\s"']{8,}/gi, '$1$2$3[REDACTED_SECRET]')
     // Keep the port's additional recognizable credential protections.

@@ -53,7 +53,8 @@ export function pruneOldExtensionResources(root: string, nowMs = Date.now()) {
   if (!fs.existsSync(ext)) return;
   for (const e of fs.readdirSync(ext, { withFileTypes: true })) {
     if (!e.isDirectory() || !fs.existsSync(path.join(ext, e.name, "instructions.md"))) continue;
-    const res = jail.resolve(`extensions/${e.name}/resources`, { mustExist: false });
+    let res: string;
+    try { res = jail.resolve(`extensions/${e.name}/resources`, { mustExist: false }); } catch { continue; } // odd names (':' etc.) must not abort pruning of other extensions
     if (!fs.existsSync(res)) continue;
     for (const f of fs.readdirSync(res)) {
       if (!f.endsWith(".md") || !fs.lstatSync(path.join(res, f)).isFile()) continue;
@@ -96,9 +97,10 @@ export function rolloutSummaryFileStem(threadId: string, sourceUpdatedAtSec: num
 export const stemOf = (m: Stage1Output) => rolloutSummaryFileStem(m.threadId, m.sourceUpdatedAt, m.rolloutSlug);
 
 function summaryNames(memories: Stage1Output[]) {
+  const stems = new Map(memories.map(m => [m.threadId, stemOf(m)]));
   const counts = new Map<string, number>();
-  for (const m of memories) counts.set(stemOf(m), (counts.get(stemOf(m)) ?? 0) + 1);
-  return new Map(memories.map(m => [m.threadId, stemOf(m) + ((counts.get(stemOf(m)) ?? 0) > 1 ? '-' + createHash('sha256').update(m.threadId).digest('hex') : '')]));
+  for (const stem of stems.values()) counts.set(stem, (counts.get(stem) ?? 0) + 1);
+  return new Map(memories.map(m => { const stem = stems.get(m.threadId)!; return [m.threadId, stem + ((counts.get(stem) ?? 0) > 1 ? '-' + createHash('sha256').update(m.threadId).digest('hex') : '')]; }));
 }
 
 export function syncRolloutSummaries(root: string, memories: Stage1Output[]) {
@@ -158,7 +160,7 @@ export function validateConsolidationArtifacts(root: string, version: "v1" | "v2
   const removed = removeMemorySymlinks(root);
   if (removed) throw new Error(`removed ${removed} symbolic links from consolidated memory workspace`);
   const mem = path.join(root, "MEMORY.md");
-  if (version === "v1" && (!fs.existsSync(mem) || !fs.statSync(mem).isFile())) throw new Error(`consolidated memory artifact missing: ${mem}`);
+  if (version === "v1" && (!fs.existsSync(mem) || !fs.lstatSync(new RootJail(root).resolve("MEMORY.md")).isFile())) throw new Error(`consolidated memory artifact missing: ${mem}`);
   const sum = path.join(root, "memory_summary.md");
   if (!fs.existsSync(sum)) throw new Error(`memory summary artifact missing: ${sum}`);
   const content = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(readBounded(new RootJail(root).resolve('memory_summary.md')));

@@ -26,7 +26,9 @@ export class RootJail {
     const target = path.resolve(this.root, rel);
     const relative = path.relative(this.root, target);
     if (relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) throw new Error("path escapes memory root");
-    if (relative.split(path.sep)[0].toLowerCase() === ".git") throw new Error(".git is not accessible");
+    const first = relative.split(path.sep)[0].toLowerCase();
+    if (first === ".git") throw new Error(".git is not accessible");
+    if (first.startsWith(".git") || first.startsWith(".memory-") || /\.tmp$/i.test(relative)) throw new Error("reserved path");
     // No symlink/junction anywhere along the existing prefix.
     let cur = this.root;
     for (const seg of relative.split(path.sep).filter(Boolean)) {
@@ -71,7 +73,9 @@ export function consolidationTools(jail: RootJail) {
         const buf = readBounded(p);
         const lines = buf.toString("utf8").split("\n");
         const s = Math.max(1, a.start ?? 1), e = Math.min(lines.length, a.end ?? lines.length);
-        return text(truncateBytes(lines.slice(s - 1, e).map((l, i) => `${s + i}: ${l}`).join("\n"), MAX_READ_BYTES - 96));
+        const body = lines.slice(s - 1, e).map((l, i) => `${s + i}: ${l}`).join("\n");
+        const out = truncateBytes(body, MAX_READ_BYTES - 96);
+        return text(out === body ? out : out + `\n[... truncated at ${MAX_READ_BYTES} bytes; use start/end line ranges ...]`);
       },
     },
     {
@@ -84,14 +88,15 @@ export function consolidationTools(jail: RootJail) {
         const files = fs.statSync(start).isFile() ? [start] : listDir(jail, a.path ?? ".", true).filter(l => !l.endsWith("/")).map(l => jail.resolve(l.replace(/ \(\d+ bytes\)$/, "")));
         for (const f of files) {
           if (hits.length >= MAX_GREP_HITS) break;
-          const bytes = readBounded(jail.resolve(jail.rel(f)));
+          let bytes: Buffer; try { bytes = readBounded(f); } catch { continue; }
           scanned += bytes.length;
           if (scanned > 32 * 1024 * 1024) throw new Error('grep scan budget exceeded; narrow path');
           const lines = bytes.toString('utf8').split('\n');
           let indices: number[];
           if (a.regex) {
             // Isolate backtracking from the host and enforce a killable deadline.
-            const child = spawnSync(process.execPath, ['-e', "let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>{const {pattern,lines}=JSON.parse(s),r=new RegExp(pattern,'i'),out=[];for(let i=0;i<lines.length&&out.length<200;i++)if(r.test(lines[i]))out.push(i);process.stdout.write(JSON.stringify(out));});"], { input: JSON.stringify({ pattern: a.pattern, lines }), encoding: 'utf8', timeout: 1000, maxBuffer: 65536 });
+            try { new RegExp(a.pattern, 'i'); } catch (e) { throw new Error(`invalid regex: ${(e as Error).message}`); }
+            const child = spawnSync(process.execPath, ['-e', "let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>{const {pattern,lines,max}=JSON.parse(s),r=new RegExp(pattern,'i'),out=[];for(let i=0;i<lines.length&&out.length<max;i++)if(r.test(lines[i]))out.push(i);process.stdout.write(JSON.stringify(out));});"], { input: JSON.stringify({ pattern: a.pattern, lines, max: MAX_GREP_HITS }), encoding: 'utf8', timeout: 1000, maxBuffer: 65536 });
             if (child.error || child.status !== 0) throw new Error('regex search failed or timed out');
             indices = JSON.parse(child.stdout);
           } else indices = lines.flatMap((line, i) => line.toLowerCase().includes(q) ? [i] : []).slice(0, MAX_GREP_HITS);
@@ -114,11 +119,11 @@ export function consolidationTools(jail: RootJail) {
     },
     {
       def: { name: "delete", description: "Delete a file (or empty directory) inside the memory root. Never deletes ad-hoc notes or the workspace diff.", parameters: Type.Object({ path: Type.String() }) },
-      run: a => {
+      run: a => withFileLock(path.join(jail.root, '.memory-write.lock'), () => {
         const p = jail.resolve(a.path); const rel = jail.rel(p), protectedPath = rel.toLowerCase();
         if (!rel || protectedPath === 'extensions/ad_hoc/notes' || protectedPath.startsWith("extensions/ad_hoc/notes/") || protectedPath === "phase2_workspace_diff.md") throw new Error("this file must not be deleted");
         const st = fs.lstatSync(p); if (st.isDirectory()) fs.rmdirSync(p); else fs.unlinkSync(p); return text(`deleted ${rel}`);
-      },
+      }),
     },
     {
       def: { name: "mkdir", description: "Create a directory inside the memory root.", parameters: Type.Object({ path: Type.String() }) },

@@ -50,20 +50,21 @@ export async function run(store: MemoryStore, cfg: MemoriesConfig, llm: Llm, cur
     for (const c of pending) try {
       if (!store.heartbeatStage1Job(c.thread.id, c.ownershipToken, STAGE1.JOB_LEASE_SECONDS)) controllers.get(c.ownershipToken)!.abort();
     } catch { controllers.get(c.ownershipToken)!.abort(); }
-  }, 90_000);
+  }, STAGE1.JOB_HEARTBEAT_SECONDS * 1000);
 
   const job = async (claim: Stage1Claim) => {
     const { thread, ownershipToken } = claim;
     try {
       if (signal?.aborted) throw new Error("aborted");
       if (!store.heartbeatStage1Job(thread.id, ownershipToken, STAGE1.JOB_LEASE_SECONDS)) throw new Error('lost stage1 ownership');
-      const requestSignal = AbortSignal.any([controllers.get(ownershipToken)!.signal, AbortSignal.timeout(55 * 60_000), ...(signal ? [signal] : [])]);
+      const requestSignal = AbortSignal.any([controllers.get(ownershipToken)!.signal, AbortSignal.timeout(STAGE1.REQUEST_TIMEOUT_SECONDS * 1000), ...(signal ? [signal] : [])]);
       const r = renderSession(thread.rolloutPath);
       if (r.id !== thread.id) throw new Error("session header identity mismatch");
       const contents = cfg.version === "v2" ? tieredEvidence(r.rows, tokenLimit) : truncateToTokens(r.text, tokenLimit);
       const user = inputTpl.replace("{{ rollout_path }}", () => thread.rolloutPath).replace("{{ rollout_cwd }}", () => thread.cwd).replace("{{ rollout_contents }}", () => contents).replace("{{ rollout_git_branch }}", () => thread.gitBranch ?? "unknown");
       const res = await complete(llm, model, { systemPrompt: system, messages: cfg.version === "v2" ? evidenceMessages(user) : [{ role: "user", content: [{ type: "text", text: user }], timestamp: Date.now() }] }, cfg.extract_thinking, requestSignal, undefined, cfg.version);
-      if (requestSignal.aborted || !store.heartbeatStage1Job(thread.id, ownershipToken, STAGE1.JOB_LEASE_SECONDS)) throw new Error('aborted or lost stage1 ownership');
+      if (requestSignal.aborted) throw new Error(requestSignal.reason instanceof Error && requestSignal.reason.name === 'TimeoutError' ? 'request timeout' : 'aborted');
+      if (!store.heartbeatStage1Job(thread.id, ownershipToken, STAGE1.JOB_LEASE_SECONDS)) throw new Error('lost stage1 ownership');
       stats.tokens += usageOf(res).totalTokens ?? 0;
       if (res.stopReason !== "stop") throw new Error(`model stop reason: ${res.stopReason}${res.errorMessage ? ` (${res.errorMessage})` : ""}`);
       const parsed = parseJsonObject(textOf(res));
@@ -75,8 +76,13 @@ export async function run(store: MemoryStore, cfg: MemoriesConfig, llm: Llm, cur
       }
       if (store.markStage1JobSucceeded(thread.id, ownershipToken, Math.floor(thread.updatedAtMs / 1000), raw, summary, slug)) stats.withOutput++; else stats.failed++;
     } catch (e) {
-      stats.failed++;
       const reason = redact(e instanceof Error ? e.message : String(e));
+      if (signal?.aborted) {
+        // Shutdown cancellation is not a rollout failure: release without consuming retries or backoff.
+        try { if (store.releaseStage1Job(thread.id, ownershipToken)) { stats.released++; return; } } catch {}
+        stats.failed++; report(`phase1: could not release ${thread.id}; lease recovery required`); return;
+      }
+      stats.failed++;
       report(`phase1: job failed for thread ${thread.id}: ${reason}`);
       try { store.markStage1JobFailed(thread.id, ownershipToken, reason, STAGE1.JOB_RETRY_DELAY_SECONDS); }
       catch { report(`phase1: could not persist failure for ${thread.id}; lease recovery required`); }

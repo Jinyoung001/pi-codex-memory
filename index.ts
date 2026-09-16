@@ -37,6 +37,18 @@ export default function (pi: ExtensionAPI) {
   let llm: Llm | undefined;
   let startupTimer: ReturnType<typeof setTimeout> | undefined;
   const openStore = (version: MemoryVersion = activeVersion) => { let store = stores.get(version); if (!store) { store = new MemoryStore(memoryDbFor(version)); stores.set(version, store); } return store; };
+  const pollutionFile = (id: string) => path.join(POLLUTION_DIR, createHash('sha256').update(id).digest('hex') + '.json');
+  function readPollutionJournal(): string[] {
+    if (!fs.existsSync(POLLUTION_DIR)) return [];
+    const ids: string[] = [];
+    for (const file of fs.readdirSync(POLLUTION_DIR)) {
+      if (!file.endsWith('.json')) continue; // atomicWrite .tmp leftovers must not wedge the pipeline
+      const id: unknown = JSON.parse(fs.readFileSync(path.join(POLLUTION_DIR, file), 'utf8'));
+      if (typeof id !== 'string' || !id) throw new Error('invalid pollution exclusion record');
+      ids.push(id);
+    }
+    return ids;
+  }
   const isSubagent = () => !!(process.env.PI_SUBAGENT || process.env.PI_SUBAGENT_RUN_ID || process.env.PI_PARENT_SESSION);
 
   function registerCurrentThread(ctx: ExtensionContext) {
@@ -54,6 +66,7 @@ export default function (pi: ExtensionAPI) {
     const ac = new AbortController();
     const task = (async () => {
       const versions: MemoryVersion[] = cfg.dual_write ? ["v1", "v2"] : [activeVersion];
+      const pollutedIds = readPollutionJournal();
       await Promise.allSettled(versions.map(async version => {
       if (ac.signal.aborted) return;
       try {
@@ -63,11 +76,7 @@ export default function (pi: ExtensionAPI) {
           seedExtensionInstructions(root, fs.readFileSync(path.join(PROMPTS, "extensions", "ad_hoc", "instructions.md"), "utf8"));
         });
         const n = indexSessions(t => st.upsertThread(t));
-        if (fs.existsSync(POLLUTION_DIR)) for (const file of fs.readdirSync(POLLUTION_DIR)) {
-          const id: unknown = JSON.parse(fs.readFileSync(path.join(POLLUTION_DIR, file), 'utf8'));
-          if (typeof id !== 'string') throw new Error('invalid pollution exclusion record');
-          st.setThreadMemoryMode(id, 'polluted');
-        }
+        for (const id of pollutedIds) st.setThreadMemoryMode(id, 'polluted');
         st.archiveMissingThreadFiles();
         log(`startup: indexed ${n} session file(s)`);
         phase1.prune(st, config, log);
@@ -136,19 +145,21 @@ export default function (pi: ExtensionAPI) {
     const mcpSource = source && (source.source.startsWith("mcp:") || /(?:^npm:|[\\/])pi-mcp-adapter(?:@|[\\/]|$)/i.test(source.source) || /[\\/]pi-mcp-adapter[\\/]/i.test(source.path));
     if (EXTERNAL_CONTEXT_TOOLS.test(name) || mcpSource) {
       try {
-        atomicWrite(path.join(POLLUTION_DIR, createHash('sha256').update(sessionId).digest('hex') + '.json'), JSON.stringify(sessionId));
+        atomicWrite(pollutionFile(sessionId), JSON.stringify(sessionId));
       } catch (e) {
-        running?.ac.abort(); cfg.enabled = false;
+        running?.ac.abort();
+        try { saveConfig({ enabled: false }); } catch {}
+        cfg.enabled = false;
         log(`pollution exclusion persistence failed; extension disabled: ${String(e)}`);
-        throw e;
+        return;
       }
-        for (const version of ["v1", "v2"] as const) {
-          try {
+      for (const version of ["v1", "v2"] as const) {
+        try {
           const st = openStore(version);
           if (sessionFile) { const h = readSessionHeader(sessionFile, Date.now()); if (h) st.upsertThread({ id: h.id, rolloutPath: h.file, cwd: h.cwd, updatedAtMs: h.mtimeMs, memoryMode: "enabled", gitBranch: null }); }
           if (st.setThreadMemoryMode(sessionId, "polluted")) log(`thread ${sessionId} marked polluted (${version}) by ${event.toolName}`);
-          } catch (e) { log(`pollution mark failed (${version}); durable exclusion retained: ${String(e)}`); }
-        }
+        } catch (e) { log(`pollution mark failed (${version}); durable exclusion retained: ${String(e)}`); }
+      }
     }
   });
 
@@ -206,6 +217,7 @@ export default function (pi: ExtensionAPI) {
         case "thread": {
           if (!sessionId) return say("memories: no persistent session", "warning");
           if (a[1] !== "on" && a[1] !== "off") return say("usage: /memories thread on|off", "warning");
+          if (a[1] === "on") fs.rmSync(pollutionFile(sessionId), { force: true }); // otherwise journal replay re-pollutes on next run
           for (const version of ["v1", "v2"] as const) {
             const st = openStore(version);
             if (sessionFile) { const h = readSessionHeader(sessionFile, Date.now()); if (h) st.upsertThread({ id: h.id, rolloutPath: h.file, cwd: h.cwd, updatedAtMs: h.mtimeMs, memoryMode: "enabled", gitBranch: null }); }

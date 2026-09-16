@@ -62,14 +62,16 @@ export function searchMemories(root: string, p: { queries: string[]; match_mode?
   if (size > 1000 || context > 1000 || queries.length > 100 || queries.some(q => q.length > 10000)) throw new Error('search input budget exceeded; narrow query');
   const start = scoped(root, p.path), jail = new RootJail(root), files: string[] = [], pending = [start];
   let entries = 0;
-  while (pending.length) { if (++entries > 10000) throw new Error('search file budget exceeded; narrow path'); const current = scoped(root, jail.rel(pending.pop()!) || '.'); if (fs.statSync(current).isFile()) files.push(current); else for (const entry of children(current)) pending.push(path.join(current, entry.name)); }
+  while (pending.length) { if (++entries > 10000) throw new Error('search file budget exceeded; narrow path'); const current = jail.resolve(jail.rel(pending.pop()!) || '.'); if (fs.statSync(current).isFile()) files.push(current); else for (const entry of children(current)) pending.push(path.join(current, entry.name)); }
   const matches: { path: string; match_line_number: number; content_start_line_number: number; content: string; matched_queries: string[] }[] = [];
   let seen = 0, scanned = 0, hasMore = false;
   filesLoop: for (const file of files.sort(compare)) {
     let content: string;
-    try { content = decode(scoped(root, jail.rel(file))); } catch (e) { if (e instanceof TypeError) continue; throw e; }
-    scanned += Buffer.byteLength(content);
-    if (scanned > 32 * 1024 * 1024) throw new Error('search byte budget exceeded; narrow path');
+    // Skip undecodable, oversized or hard-linked files like Codex skips invalid UTF-8; one bad file must not abort the search.
+    let bytes: Uint8Array;
+    try { bytes = readBounded(jail.resolve(jail.rel(file))); content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes); } catch (e) { if (e instanceof TypeError || /input limit|single-link/.test(String(e))) continue; throw e; }
+    scanned += bytes.length;
+    if (scanned > 32 * 1024 * 1024) { if (matches.length) { hasMore = true; break filesLoop; } throw new Error('search byte budget exceeded; narrow path'); }
     const lines = content ? content.replace(/\r\n/g, "\n").replace(/\n$/, "").split("\n") : [];
     const flags = lines.map(line => { const text = normalize(line); return prepared.map(q => text.includes(q)); });
     const windows: { start: number; end: number; found: boolean[] }[] = [];
@@ -89,7 +91,7 @@ export function searchMemories(root: string, p: { queries: string[]; match_mode?
       if (matches.length === limit) { hasMore = true; break filesLoop; }
       const window = windows[i];
       const from = Math.max(0, window.start - context), to = Math.min(lines.length, window.end + context + 1);
-      matches.push({ path: jail.rel(file), match_line_number: window.start + 1, content_start_line_number: from + 1, content: lines.slice(from, to).join("\n"), matched_queries: queries.filter((_, i) => window.found[i]) });
+      matches.push({ path: jail.rel(file), match_line_number: window.start + 1, content_start_line_number: from + 1, content: lines.slice(from, to).join("\n"), matched_queries: queries.filter((_, k) => window.found[k]) });
     }
   }
   if (offset > seen) throw new Error('invalid cursor');

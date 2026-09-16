@@ -83,6 +83,17 @@ Example from a local machine (5 sessions, 745K rendered tokens, OpenRouter list 
 
 Budget 500 cuts rendered rollouts by ~47% at the cost of shorter non-error tool output. Sessions already above the 150K cap do not get cheaper — they get a better-balanced input. Set `BENCH_PRICES='{"name":{"in":..,"out":..}}'` to compare other models.
 
+**What compaction can and cannot save.** The saving is bounded by the share of tool output in a rollout: `≈ tool_share × (1 − 1/compression)`, and zero for sessions that still exceed the 150K cap afterwards. Sessions dominated by file reads and command output (typically 70–90% tool output) save 30–60%; sessions that are mostly assistant code and pasted text, or whose tool output was already compacted live (e.g. by an `rtk`-style shell filter), save little. This is expected: live filters cut the same bytes once at the source, and stage 1 reads each rollout only once, so there is no per-turn multiplier to amplify the gain.
+
+End-to-end check (`scripts/bench-pipeline.sh`, real phase 1 + phase 2 in an isolated home, same two claimed sessions, `gpt-6-astra`, thinking low): budget 0 → phase 1 223K tokens, phase 2 42K input / 132K cached / 5.3K output; budget 1000 → phase 1 225K, phase 2 31K / 164K / 6.0K. No stage-1 saving there because the large session was 10% tool output and stayed above the cap. The model choice dominated instead: the same run on `deepseek-v4.1-flash` cost roughly 11× less (thinking `max`) to 30–40× less (thinking `low`).
+
+```bash
+# real model calls, costs money; label extract_model consolidation_model extract_thinking consolidation_thinking budget [provider/model for the session]
+scripts/bench-pipeline.sh G1 null null low low 1000 openai-codex/gpt-6-astra
+```
+
+Every pipeline run appends `phase1: … N tokens` and `phase2: usage requests=… input=… cacheRead=… output=…` to `memories.log`, so you can read your own numbers after normal use.
+
 Models accept `provider/model-id`. By default, both stages use the current pi session model (`null`); an explicit setting overrides it for that stage. Codex's preferred models are not selected automatically. Explicit settings fail if unavailable or unauthenticated; request errors never trigger a model switch. `/memories status` shows the last selected provider/model, `session-default` or `explicit`, and extraction output enforcement.
 
 ### Choosing a memory model

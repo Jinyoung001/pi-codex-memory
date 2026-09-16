@@ -3,7 +3,9 @@
 // drop developer/system-injected content, keep user/assistant/tool items, redact, truncate to token budget.
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import { redact } from "../safety.js";
+import { truncateTokens } from "./codex-truncate.ts";
 import { SESSIONS_DIR, STAGE1 } from "./config.ts";
 import type { ThreadRow } from "./store.ts";
 
@@ -111,11 +113,27 @@ export function normalizeSession(file: string): {id:string;cwd:string;evidence:E
   return {id,cwd,evidence};
 }
 
-export function renderSession(file: string): { id: string; cwd: string; text: string; rows: string[]; evidence:Evidence[] } {
+// Host addition (not upstream): shrink tool results before stage-1 extraction. Tool output is ~70% of a
+// rollout and mostly file dumps/command noise; user and assistant text is never touched. Errors keep a
+// larger budget because failures are what memory is for. Deterministic, no external tools.
+export function compactToolResult(text: string, budget: number, isError: boolean, seen: Map<string, number>, index: number): string {
+  if (budget <= 0) return text;
+  const key = createHash('sha256').update(text).digest('hex');
+  const first = seen.get(key);
+  if (first !== undefined && text.length > 200) return `[identical to tool result #${first}]`;
+  seen.set(key, index);
+  // Fold runs of identical lines (rtk-style dedup): progress bars, repeated warnings, log spam.
+  const lines = text.split('\n'), folded: string[] = [];
+  for (let i = 0; i < lines.length; i++) { let n = 1; while (i + n < lines.length && lines[i + n] === lines[i]) n++; folded.push(n > 2 ? `${lines[i]}\n[… same line ×${n}]` : lines.slice(i, i + n).join('\n')); i += n - 1; }
+  return truncateTokens(folded.join('\n'), isError ? budget * 3 : budget);
+}
+
+export function renderSession(file: string, toolResultTokenBudget = 0): { id: string; cwd: string; text: string; rows: string[]; evidence:Evidence[] } {
   const {id,cwd,evidence}=normalizeSession(file);
 
   const out: string[] = [], rows: string[] = [];
   const questions=new Map<string,string>();
+  const seenResults = new Map<string, number>(); let resultIndex = 0;
   for (const e of evidence) {
     const m = e.message;
     const kinds=m.internal_chat_message_metadata_passthrough?.content_item_kinds;
@@ -140,7 +158,7 @@ export function renderSession(file: string): { id: string; cwd: string; text: st
         }
       }
     } else if (m.role === "toolResult") {
-      const t = textOf(m.content, { toolCalls: false });
+      const t = compactToolResult(textOf(m.content, { toolCalls: false }), toolResultTokenBudget, !!m.isError, seenResults, ++resultIndex);
       const row = `[tool ${m.toolName}${m.isError ? " (error)" : ""}]\n${t}`;
       out.push(row);
       let human=false;

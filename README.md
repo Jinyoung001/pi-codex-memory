@@ -53,10 +53,13 @@ Saved in `~/.pi/agent/memories.json`:
   "min_rollout_idle_hours": 6,
   "extract_model": null,
   "consolidation_model": null,
+  "tool_result_token_budget": 1000,
   "extract_thinking": "low",
   "consolidation_thinking": "medium"
 }
 ```
+
+`tool_result_token_budget` is a host addition (not in Codex): before extraction, each tool result in a rollout is capped to this many tokens (errors get 3x), runs of identical lines are folded, and repeated identical results are replaced by a back-reference. User and assistant text is never altered. `0` disables it. On local sessions this cut rendered rollouts by ~35% at 1000 and ~47% at 500 (`node --experimental-strip-types scripts/bench-compaction.mjs [budget]` measures your own sessions without model calls).
 
 Models accept `provider/model-id`. By default, both stages use the current pi session model (`null`); an explicit setting overrides it for that stage. Codex's preferred models are not selected automatically. Explicit settings fail if unavailable or unauthenticated; request errors never trigger a model switch. `/memories status` shows the last selected provider/model, `session-default` or `explicit`, and extraction output enforcement.
 

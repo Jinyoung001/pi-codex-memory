@@ -58,7 +58,7 @@ export async function run(store: MemoryStore, cfg: MemoriesConfig, llm: Llm, cur
       if (signal?.aborted) throw new Error("aborted");
       if (!store.heartbeatStage1Job(thread.id, ownershipToken, STAGE1.JOB_LEASE_SECONDS)) throw new Error('lost stage1 ownership');
       const requestSignal = AbortSignal.any([controllers.get(ownershipToken)!.signal, AbortSignal.timeout(STAGE1.REQUEST_TIMEOUT_SECONDS * 1000), ...(signal ? [signal] : [])]);
-      const r = renderSession(thread.rolloutPath);
+      const r = renderSession(thread.rolloutPath, cfg.tool_result_token_budget);
       if (r.id !== thread.id) throw new Error("session header identity mismatch");
       const contents = cfg.version === "v2" ? tieredEvidence(r.rows, tokenLimit) : truncateToTokens(r.text, tokenLimit);
       const user = inputTpl.replace("{{ rollout_path }}", () => thread.rolloutPath).replace("{{ rollout_cwd }}", () => thread.cwd).replace("{{ rollout_contents }}", () => contents).replace("{{ rollout_git_branch }}", () => thread.gitBranch ?? "unknown");

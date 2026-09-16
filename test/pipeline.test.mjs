@@ -173,6 +173,30 @@ test('renderSession follows the active branch and drops injected/developer conte
   assert.match(r.text, /\[tool_call bash\]/); assert.match(r.text, /\[tool bash\]\nout/);
 });
 
+test('tool result compaction caps, folds repeats, dedups identical results and spares errors and user text', t => {
+  const f = path.join(tmp(t), 's.jsonl');
+  const big = Array.from({ length: 400 }, (_, i) => `line ${i} ${'x'.repeat(40)}`).join('\n'), spam = Array(50).fill('warning: same').join('\n');
+  const lines = [
+    { type: 'session', version: 3, id: 'sid', timestamp: 't', cwd: 'C:/p' },
+    { type: 'message', id: 'u1', parentId: null, message: { role: 'user', content: 'keep ' + 'u'.repeat(6000) } },
+    { type: 'message', id: 'a1', parentId: 'u1', message: { role: 'assistant', content: [{ type: 'toolCall', id: 'c1', name: 'read', arguments: {} }] } },
+    { type: 'message', id: 'r1', parentId: 'a1', message: { role: 'toolResult', toolName: 'read', toolCallId: 'c1', content: [{ type: 'text', text: big }] } },
+    { type: 'message', id: 'r2', parentId: 'r1', message: { role: 'toolResult', toolName: 'read', toolCallId: 'c2', content: [{ type: 'text', text: big }] } },
+    { type: 'message', id: 'r3', parentId: 'r2', message: { role: 'toolResult', toolName: 'bash', toolCallId: 'c3', content: [{ type: 'text', text: spam }] } },
+    { type: 'message', id: 'r4', parentId: 'r3', message: { role: 'toolResult', toolName: 'bash', toolCallId: 'c4', isError: true, content: [{ type: 'text', text: big.replace(/line/g, 'err') }] } },
+  ];
+  fs.writeFileSync(f, lines.map(l => JSON.stringify(l)).join('\n') + '\n');
+  const raw = renderSession(f), small = renderSession(f, 500);
+  assert.doesNotMatch(raw.text, /truncated|identical to|same line/);
+  assert.match(small.text, /\[human user\]\nkeep u{6000}/);
+  assert.match(small.text, /\[tool read\]\nline 0 .*…\d+ tokens truncated…/s);
+  assert.match(small.text, /\[tool read\]\n\[identical to tool result #1\]/);
+  assert.match(small.text, /warning: same\n\[… same line ×50\]/);
+  const err = small.text.split('[tool bash (error)]\n')[1];
+  assert.ok(err.length > 500 * 4 && err.length <= 1500 * 4 + 64, 'error results keep a 3x budget');
+  assert.ok(small.text.length < raw.text.length / 3);
+});
+
 // ---- end-to-end with a fake model (no network) ----
 function fakeRegistry(script) {
   let i = 0;

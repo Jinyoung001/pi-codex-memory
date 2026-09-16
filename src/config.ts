@@ -32,6 +32,7 @@ export type MemoriesConfig = {
   min_rollout_idle_hours: number;
   extract_model: string | null;          // "provider/model-id"; null = current session model
   consolidation_model: string | null;
+  tool_result_token_budget: number;      // per tool result in stage-1 input; 0 disables compaction (host addition, not upstream)
   extract_thinking: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   consolidation_thinking: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 };
@@ -52,6 +53,7 @@ export const DEFAULTS: MemoriesConfig = {
   min_rollout_idle_hours: 6,
   extract_model: null,
   consolidation_model: null,
+  tool_result_token_budget: 1000,
   extract_thinking: "low",       // codex stage_one::REASONING_EFFORT
   consolidation_thinking: "medium", // codex stage_two::REASONING_EFFORT
 };
@@ -94,6 +96,7 @@ function validateConfig(raw: Record<string, unknown>): MemoriesConfig {
   cfg.max_unused_days = Math.min(365, Math.max(0, cfg.max_unused_days));
   cfg.max_rollout_age_days = Math.min(90, Math.max(0, cfg.max_rollout_age_days));
   cfg.min_rollout_idle_hours = Math.min(48, Math.max(1, cfg.min_rollout_idle_hours));
+  if (!Number.isSafeInteger(cfg.tool_result_token_budget) || cfg.tool_result_token_budget < 0) throw new Error('tool_result_token_budget must be a non-negative integer');
   const efforts = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
   if (!efforts.includes(cfg.extract_thinking) || !efforts.includes(cfg.consolidation_thinking)) throw new Error("invalid memory reasoning effort");
   cfg.max_raw_memories_for_consolidation = Math.min(4096, Math.max(1, cfg.max_raw_memories_for_consolidation));

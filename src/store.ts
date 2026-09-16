@@ -50,7 +50,8 @@ export class MemoryStore {
   constructor(file: string) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     this.db = new DatabaseSync(file);
-    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;");
+    // busy_timeout first: journal_mode=WAL needs a lock and two processes opening at once must wait, not fail.
+    this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
     const existing = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads'").get();
     if (existing) {
       const columns = new Set((this.db.prepare("PRAGMA table_info(threads)").all() as any[]).map(r=>r.name));

@@ -85,7 +85,7 @@ export default function (pi: ExtensionAPI) {
         if (ac.signal.aborted) return;
         if (!gitAvailable()) { log("phase2: git not available; consolidation skipped"); notify?.("memories: git not found, consolidation skipped"); return; }
         const r = await phase2.run(st, config, l, root, sessionId, log, { force, signal: ac.signal });
-        log(`pipeline: phase1 claimed=${p1.claimed} out=${p1.withOutput} none=${p1.noOutput} failed=${p1.failed}; phase2=${r}`);
+        log(`pipeline: phase1 claimed=${p1.claimed} out=${p1.withOutput} none=${p1.noOutput} failed=${p1.failed} tokens=${p1.tokens}; phase2=${r}`);
         if (notify && (p1.claimed || r === "succeeded" || force || r.startsWith("failed"))) notify(`memories: phase1 ${p1.withOutput}/${p1.claimed} extracted, phase2 ${r}`);
       } catch (e) { log(`pipeline ${version} error: ${(e as Error).stack ?? e}`); notify?.(`memories: pipeline error: ${(e as Error).message}`); }
       }));

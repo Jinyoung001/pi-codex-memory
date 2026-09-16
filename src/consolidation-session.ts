@@ -31,10 +31,12 @@ export async function runPiConsolidationSession(llm: Llm, model: MemoryModel, cf
   const settingsManager=SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:false},packages:[],extensions:[],skills:[],prompts:[],enableAnalytics:false,enableInstallTelemetry:false});
   const resourceLoader=new DefaultResourceLoader({cwd:root,agentDir:root,settingsManager,noExtensions:true,noSkills:true,noPromptTemplates:true,noThemes:true,noContextFiles:true,systemPrompt});
   await resourceLoader.reload();
+  const usage = { requests: 0, input: 0, output: 0, cacheRead: 0, totalTokens: 0 };
   const runtime=registryRuntime(llm,model,async(m,context,options)=>{
     if(signal.aborted)throw new Error("aborted");
     guarded(()=>{});
     const response=await llm.registry.complete(m,context,{...options,reasoningEffort:cfg.consolidation_thinking==="off"?undefined:cfg.consolidation_thinking,signal:options?.signal?AbortSignal.any([signal,options.signal]):signal});
+    usage.requests++; usage.input += response.usage?.input ?? 0; usage.output += response.usage?.output ?? 0; usage.cacheRead += response.usage?.cacheRead ?? 0; usage.totalTokens += response.usage?.totalTokens ?? 0;
     // SDK expects complete pi message metadata; provider responses already contain it.
     return {...response, api:response.api ?? m.api, provider:response.provider ?? m.provider, model:response.model ?? m.id, timestamp:response.timestamp ?? Date.now(),
       usage:Object.assign({input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0},response.usage,{cost:Object.assign({input:0,output:0,cacheRead:0,cacheWrite:0,total:0},response.usage?.cost)})};
@@ -62,7 +64,7 @@ export async function runPiConsolidationSession(llm: Llm, model: MemoryModel, cf
     if(compactionFailure)throw new Error(compactionFailure);
     const last=[...session.messages].reverse().find(m=>m.role==="assistant");
     if(last?.stopReason!=="stop")throw new Error(last?.errorMessage??"consolidation did not complete");
-    return {completed:true};
+    return {completed:true, usage};
   } finally {
     unsubscribe();signal.removeEventListener("abort",abort);
     try { await session.abort(); } catch (e) { abortError = e; }

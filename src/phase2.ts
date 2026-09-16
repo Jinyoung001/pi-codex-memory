@@ -124,6 +124,7 @@ export async function run(store: MemoryStore, cfg: MemoriesConfig, llm: Llm, roo
   try {
     const r = await runConsolidationAgent(llm, model, cfg, root, log, ac.signal, opts.onProgress, guarded);
     completed = r.completed; agentError = r.error ?? "";
+    if (r.usage) report(`phase2: usage requests=${r.usage.requests} input=${r.usage.input} cacheRead=${r.usage.cacheRead} output=${r.usage.output} total=${r.usage.totalTokens}`);
   } catch (e) { agentError = e instanceof Error ? e.message : String(e); }
   finally { clearInterval(hb); opts.signal?.removeEventListener("abort", onAbort); }
   if (ac.signal.aborted && !opts.signal?.aborted) return fail('lost_ownership');
@@ -138,6 +139,6 @@ export async function run(store: MemoryStore, cfg: MemoriesConfig, llm: Llm, roo
   } catch (e) { return fail(e instanceof Error ? e.message : String(e)); }
 }
 
-async function runConsolidationAgent(llm: Llm, model: MemoryModel, cfg: MemoriesConfig, root: string, log: Log, signal: AbortSignal, onProgress: ((s: string) => void) | undefined, guarded: <T>(fn: () => T) => T): Promise<{ completed: boolean; error?: string }> {
+async function runConsolidationAgent(llm: Llm, model: MemoryModel, cfg: MemoriesConfig, root: string, log: Log, signal: AbortSignal, onProgress: ((s: string) => void) | undefined, guarded: <T>(fn: () => T) => T): Promise<{ completed: boolean; error?: string; usage?: { requests: number; input: number; output: number; cacheRead: number; totalTokens: number } }> {
   return runPiConsolidationSession(llm,model,cfg,root,buildConsolidationPrompt(root,cfg.version)+HARNESS_NOTE(root),`Begin. Read ${WORKSPACE_DIFF.FILENAME} first.`,signal,guarded,onProgress);
 }

@@ -90,6 +90,7 @@ export function normalizeSession(file: string): {id:string;cwd:string;evidence:E
   for (const line of raw.split("\n")) {
     if (!line.trim()) continue;
     let e: any; try { e = JSON.parse(line); } catch { continue; }
+    if (!e || typeof e !== 'object' || Array.isArray(e)) continue;
     if (e.type === "session") { id = e.id ?? ""; cwd = e.cwd ?? ""; continue; }
     if (typeof e.id !== "string") continue;
     byId.set(e.id, e); last = e;
@@ -122,10 +123,10 @@ export function renderSession(file: string): { id: string; cwd: string; text: st
     if (m.role === "user") {
       const t = textOf(m.content, { toolCalls: false, user: true });
       if (!t.trim()) continue;
-      out.push(`[human user]\n${t}`);
       const agent = agentKinds || t.trimStart().startsWith("<subagent_notification>") || /^Message Type:.*\nTask name:.*\nSender:.*\nPayload:\s*(?:\n|$)/.test(t.trimStart());
-      const context = (Array.isArray(kinds)&&kinds.length>0&&kinds.every((k:any)=>typeof k==="string"&&!k.startsWith("user."))) || (Array.isArray(m.content)?m.content:[{text:t}]).some((p:any)=>typeof p.text==="string"&&/^<environment_context>[\s\S]*<\/environment_context>$/i.test(p.text.trim()));
-      rows.push(`[${agent ? "other agent" : context ? "harness context" : "human user"}]\n${t}`);
+      const context = (Array.isArray(kinds)&&kinds.length>0&&kinds.every((k:any)=>typeof k==="string"&&!k.startsWith("user."))) || (Array.isArray(m.content)?m.content:[{text:t}]).some((p:any)=>p && typeof p.text==="string"&&/^<environment_context>[\s\S]*<\/environment_context>$/i.test(p.text.trim()));
+      const row = `[${agent ? "other agent" : context ? "harness context" : "human user"}]\n${t}`;
+      out.push(row); rows.push(row);
     } else if (m.role === "assistant") {
       const t = textOf(m.content, { toolCalls: true });
       if (t.trim()) out.push(`[assistant]\n${t}`);

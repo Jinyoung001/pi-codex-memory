@@ -2,6 +2,46 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
+/** Pathname checks require trusted ancestors; they are not an OS sandbox. */
+export function assertTrustedPath(target) {
+  let current = path.resolve(target);
+  while (true) {
+    try { if (fs.lstatSync(current).isSymbolicLink()) throw new Error('symlink (symbolic link) in memory path'); }
+    catch (e) { if (e.code !== 'ENOENT') throw e; }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+}
+
+/** Fail closed on contention. Never steal a lock from a potentially live writer.
+ * @template T
+ * @param {string} file
+ * @param {() => T} fn
+ * @returns {T}
+ */
+export function withFileLock(file, fn) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const fd = fs.openSync(file, 'wx', 0o600);
+  try { return fn(); }
+  finally { try { fs.closeSync(fd); } finally { fs.unlinkSync(file); } }
+}
+
+/** Bound allocation and reject hard links using the actual opened descriptor. */
+export function readBounded(file, maxBytes = 8 * 1024 * 1024) {
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.nlink > 1) throw new Error('not a single-link regular file');
+    if (st.size > maxBytes) throw new Error(`file exceeds ${maxBytes} byte input limit`);
+    const bytes = Buffer.alloc(Math.min(st.size + 1, maxBytes + 1));
+    let used = 0, n;
+    while (used < bytes.length && (n = fs.readSync(fd, bytes, used, bytes.length - used, null))) used += n;
+    if (used > maxBytes || used > st.size) throw new Error('file changed or exceeded input limit');
+    return bytes.subarray(0, used);
+  } finally { fs.closeSync(fd); }
+}
+
 /** Read JSON; a damaged store is an error, never an empty new store. */
 export function readJson(file, initial) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
@@ -18,8 +58,10 @@ export function atomicWrite(file, text) {
   } finally { fs.rmSync(tmp, { force: true }); }
 }
 
-/** Existing Markdown files only. Reject traversal, sibling prefixes, symlinks and junctions. */
+/** Existing Markdown files only. Requires a trusted root and ancestors: path checks
+ * cannot prevent another process replacing a checked component before an open. */
 export function memoryPath(root, name) {
+  assertTrustedPath(root);
   if (!name || path.isAbsolute(name) || name.includes(':') || !name.endsWith('.md')) throw new Error('Invalid memory path');
   const base = fs.realpathSync(root);
   const target = path.resolve(base, name);
@@ -36,8 +78,16 @@ export function memoryPath(root, name) {
 
 /** Listing and searching share the same no-symlink boundary as reading. */
 export function markdownFiles(root, dir = '') {
+  assertTrustedPath(root);
   const out = [];
+  if (path.isAbsolute(dir) || dir.includes(':') || dir.split(/[\\/]/).includes('..')) throw new Error('Invalid memory directory');
   if (!fs.existsSync(root)) return out;
+  if (fs.lstatSync(root).isSymbolicLink()) throw new Error('Symlink in memory path');
+  let current = root;
+  for (const segment of dir.split(/[\\/]/).filter(Boolean)) {
+    current = path.join(current, segment);
+    if (fs.lstatSync(current).isSymbolicLink()) throw new Error('Symlink in memory path');
+  }
   for (const entry of fs.readdirSync(path.join(root, dir), { withFileTypes: true })) {
     if (entry.name.startsWith('.') || entry.isSymbolicLink()) continue;
     const name = path.join(dir, entry.name);
@@ -52,7 +102,7 @@ export function redact(text) {
   // Pinned codex-secrets sanitizer order and replacement text.
   return text
     .replace(/\bBearer[ \t]+[A-Za-z0-9._~+/-]{16,}=*/gi, 'Bearer [REDACTED_SECRET]')
-    .replace(/sk-[A-Za-z0-9]{20,}/g, '[REDACTED_SECRET]')
+    .replace(/sk-[A-Za-z0-9_-]{20,}/g, '[REDACTED_SECRET]')
     .replace(/\bAKIA[0-9A-Z]{16}\b/g, '[REDACTED_SECRET]')
     .replace(/\b(api[_-]?key|token|secret|password)\b(\s*[:=]\s*)(["']?)[^\s"']{8,}/gi, '$1$2$3[REDACTED_SECRET]')
     // Keep the port's additional recognizable credential protections.
@@ -74,4 +124,3 @@ export function extractionOutput(value) {
   if (value.rollout_slug !== undefined && value.rollout_slug !== null && typeof value.rollout_slug !== 'string') throw new Error('Invalid extraction field: rollout_slug');
   return value;
 }
-

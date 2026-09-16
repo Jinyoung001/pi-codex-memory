@@ -3,7 +3,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { atomicWrite, readJson } from "../safety.js";
+import { atomicWrite, readJson, withFileLock } from "../safety.js";
 
 export const PI_HOME = path.join(os.homedir(), ".pi", "agent");
 // PI_CODEX_MEMORY_HOME: test/dev override so smoke runs never touch the real memory root or DB.
@@ -64,8 +64,14 @@ export const EXTENSION_RESOURCES = { RETENTION_DAYS: 7 };
 export const SUMMARY_TOKEN_LIMIT = 2_500; // ext/memories MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_SUMMARY_TOKEN_LIMIT
 
 export function loadConfig(): MemoriesConfig {
-  const raw = readJson(CONFIG_FILE, {}) as Partial<MemoriesConfig>;
+  return validateConfig(readConfigObject());
+}
+function readConfigObject(): Record<string, unknown> {
+  const raw: unknown = readJson(CONFIG_FILE, {});
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("memories config must be an object");
+  return raw as Record<string, unknown>;
+}
+function validateConfig(raw: Record<string, unknown>): MemoriesConfig {
   const cfg: MemoriesConfig = { ...DEFAULTS };
   for (const k of Object.keys(DEFAULTS) as (keyof MemoriesConfig)[]) {
     if (k === "extract_model" || k === "consolidation_model") {
@@ -77,7 +83,8 @@ export function loadConfig(): MemoriesConfig {
       cfg[k] = model;
     } else if (raw[k] !== undefined) {
       if (typeof raw[k] !== typeof DEFAULTS[k]) throw new Error(`${k} must be ${typeof DEFAULTS[k]}`);
-      (cfg as any)[k] = raw[k];
+      // Runtime checks above establish the default's primitive type; enum/integer checks follow.
+      Object.assign(cfg, { [k]: raw[k] });
     }
   }
   if (cfg.version !== "v1" && cfg.version !== "v2") throw new Error("version must be v1 or v2");
@@ -95,12 +102,16 @@ export function loadConfig(): MemoriesConfig {
 }
 
 export function saveConfig(patch: Partial<MemoriesConfig>) {
-  const raw = readJson(CONFIG_FILE, {}) as Record<string, unknown>;
-  atomicWrite(CONFIG_FILE, JSON.stringify({ ...raw, ...patch }, null, 2) + "\n");
+  return withFileLock(CONFIG_FILE + '.lock', () => {
+    const merged = { ...readConfigObject(), ...patch };
+    validateConfig(merged);
+    atomicWrite(CONFIG_FILE, JSON.stringify(merged, null, 2) + "\n");
+  });
 }
 
 export function migrateLegacyConfig(): string[] {
-  const raw = readJson(CONFIG_FILE, {}) as Record<string, unknown>;
+  return withFileLock(CONFIG_FILE + '.lock', () => {
+  const raw = readConfigObject();
   const removed = ["consolidation_max_turns","profile","recall_max_bytes","recall_max_tokens","recall_semantic","core_max_tokens","memory_auto_tidy","memory_daily_calls"].filter(k => Object.hasOwn(raw,k));
   if (!removed.length) return [];
   let backup = CONFIG_FILE + ".before-codex-only.bak";
@@ -109,8 +120,12 @@ export function migrateLegacyConfig(): string[] {
   for (const k of removed) delete raw[k];
   atomicWrite(CONFIG_FILE,JSON.stringify(raw,null,2)+"\n");
   return removed;
+  });
 }
 
 export function ensureConfigFile() {
-  if (!fs.existsSync(CONFIG_FILE)) atomicWrite(CONFIG_FILE, JSON.stringify(DEFAULTS, null, 2) + "\n");
+  withFileLock(CONFIG_FILE + '.lock', () => {
+    try { fs.writeFileSync(CONFIG_FILE, JSON.stringify(DEFAULTS, null, 2) + '\n', { flag: 'wx', mode: 0o600 }); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e; }
+  });
 }

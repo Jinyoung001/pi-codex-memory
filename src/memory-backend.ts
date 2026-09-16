@@ -3,8 +3,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { RootJail } from "./agent-tools.ts";
 import { truncateTokens as truncateToTokens } from "./codex-truncate.ts";
+import { readBounded } from '../safety.js';
 
-const decode = (file: string) => new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(fs.readFileSync(file));
+const decode = (file: string) => new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(readBounded(file));
 const compare = (a: string, b: string) => Buffer.compare(Buffer.from(a), Buffer.from(b));
 function scoped(root: string, relative = ".") {
   if (relative.split(/[\\/]/).some(p => p === ".." || (p.startsWith(".") && p !== "."))) throw new Error("invalid memory path");
@@ -47,6 +48,9 @@ export function readMemory(root: string, p: { path: string; line_offset?: number
 }
 export type MatchMode = { type: "any" } | { type: "all_on_same_line" } | { type: "all_within_lines"; line_count: number };
 export function searchMemories(root: string, p: { queries: string[]; match_mode?: MatchMode; path?: string; cursor?: string; context_lines?: number; case_sensitive?: boolean; normalized?: boolean; max_results?: number }) {
+  const offset = p.cursor === undefined ? 0 : Number(p.cursor), limit = Math.min(p.max_results ?? 200, 200);
+  if (!Number.isSafeInteger(offset) || offset < 0 || (p.cursor !== undefined && !/^\+?\d+$/.test(p.cursor))) throw new Error('invalid cursor');
+  if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('max_results must be positive');
   if (!Array.isArray(p.queries) || !p.queries.length || p.queries.some(q => typeof q !== "string" || !q.trim())) throw new Error("queries must not be empty");
   const queries = p.queries.map(q => q.trim()), mode = p.match_mode ?? { type: "any" };
   const normalize = (s: string) => { const value = p.case_sensitive === false ? s.toLowerCase() : s; return p.normalized ? value.replace(/[^\p{Alphabetic}\p{N}]/gu, "") : value; };
@@ -55,12 +59,17 @@ export function searchMemories(root: string, p: { queries: string[]; match_mode?
   const size = mode.type === "all_within_lines" ? mode.line_count : 1, context = p.context_lines ?? 0;
   if (!["any", "all_on_same_line", "all_within_lines"].includes(mode.type) || !Number.isSafeInteger(size) || size < 1) throw new Error("invalid match window");
   if (!Number.isSafeInteger(context) || context < 0) throw new Error("invalid context_lines");
+  if (size > 1000 || context > 1000 || queries.length > 100 || queries.some(q => q.length > 10000)) throw new Error('search input budget exceeded; narrow query');
   const start = scoped(root, p.path), jail = new RootJail(root), files: string[] = [], pending = [start];
-  while (pending.length) { const current = pending.pop()!; if (fs.statSync(current).isFile()) files.push(current); else for (const entry of children(current)) pending.push(path.join(current, entry.name)); }
+  let entries = 0;
+  while (pending.length) { if (++entries > 10000) throw new Error('search file budget exceeded; narrow path'); const current = scoped(root, jail.rel(pending.pop()!) || '.'); if (fs.statSync(current).isFile()) files.push(current); else for (const entry of children(current)) pending.push(path.join(current, entry.name)); }
   const matches: { path: string; match_line_number: number; content_start_line_number: number; content: string; matched_queries: string[] }[] = [];
-  for (const file of files.sort(compare)) {
+  let seen = 0, scanned = 0, hasMore = false;
+  filesLoop: for (const file of files.sort(compare)) {
     let content: string;
     try { content = decode(scoped(root, jail.rel(file))); } catch (e) { if (e instanceof TypeError) continue; throw e; }
+    scanned += Buffer.byteLength(content);
+    if (scanned > 32 * 1024 * 1024) throw new Error('search byte budget exceeded; narrow path');
     const lines = content ? content.replace(/\r\n/g, "\n").replace(/\n$/, "").split("\n") : [];
     const flags = lines.map(line => { const text = normalize(line); return prepared.map(q => text.includes(q)); });
     const windows: { start: number; end: number; found: boolean[] }[] = [];
@@ -72,13 +81,17 @@ export function searchMemories(root: string, p: { queries: string[]; match_mode?
         if (mode.type === "any" ? found.some(Boolean) : found.every(Boolean)) { windows.push({ start: i, end: j, found }); break; }
       }
     }
-    // ponytail: upstream's O(n²) minimal-window suppression; use interval filtering if large files become common.
-    for (const window of windows) {
-      if (windows.some(other => other !== window && other.start >= window.start && other.end <= window.end)) continue;
+    const minimal = new Set<number>(); let nextEnd = Infinity;
+    for (let i = windows.length - 1; i >= 0; i--) { if (windows[i].end < nextEnd) minimal.add(i); nextEnd = Math.min(nextEnd, windows[i].end); }
+    for (let i = 0; i < windows.length; i++) {
+      if (!minimal.has(i)) continue;
+      if (seen++ < offset) continue;
+      if (matches.length === limit) { hasMore = true; break filesLoop; }
+      const window = windows[i];
       const from = Math.max(0, window.start - context), to = Math.min(lines.length, window.end + context + 1);
       matches.push({ path: jail.rel(file), match_line_number: window.start + 1, content_start_line_number: from + 1, content: lines.slice(from, to).join("\n"), matched_queries: queries.filter((_, i) => window.found[i]) });
     }
   }
-  const result = page(matches, p.cursor, p.max_results ?? 200, 200);
-  return { queries, match_mode: mode, path: p.path ?? null, matches: result.items, next_cursor: result.next_cursor, truncated: result.truncated };
+  if (offset > seen) throw new Error('invalid cursor');
+  return { queries, match_mode: mode, path: p.path ?? null, matches, next_cursor: hasMore ? String(offset + matches.length) : null, truncated: hasMore };
 }

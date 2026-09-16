@@ -11,13 +11,13 @@ import type { MemoryStore, Stage1Claim } from "./store.ts";
 import { tieredEvidence, evidenceMessages, v2Output } from "./v2.ts";
 
 export type Log = (s: string) => void;
-export type Phase1Stats = { claimed: number; withOutput: number; noOutput: number; failed: number; tokens: number };
+export type Phase1Stats = { claimed: number; withOutput: number; noOutput: number; failed: number; released: number; tokens: number };
 
 const PROMPTS = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "prompts");
 const readPrompt = (n: string) => fs.readFileSync(path.join(PROMPTS, n), "utf8");
 
 // Codex deserializes the complete response; fenced JSON or trailing prose is an error.
-export function parseJsonObject(source: string): any {
+export function parseJsonObject(source: string): unknown {
   try { return JSON.parse(source); }
   catch { throw new Error("invalid extraction JSON"); } // Do not log JSON.parse's raw response excerpt.
 }
@@ -28,7 +28,9 @@ export function prune(store: MemoryStore, cfg: MemoriesConfig, log: Log) {
 }
 
 export async function run(store: MemoryStore, cfg: MemoriesConfig, llm: Llm, currentThreadId: string, log: Log, signal?: AbortSignal): Promise<Phase1Stats> {
-  const stats: Phase1Stats = { claimed: 0, withOutput: 0, noOutput: 0, failed: 0, tokens: 0 };
+  const stats: Phase1Stats = { claimed: 0, withOutput: 0, noOutput: 0, failed: 0, released: 0, tokens: 0 };
+  if (signal?.aborted) return stats;
+  const report = (message: string) => { try { log(redact(message)); } catch {} };
   const selection = resolveMemoryModel(llm, cfg.extract_model);
   const model = selection.model;
   store.setSetting("runtime:extraction",JSON.stringify({model:`${model.provider}/${model.id}`,selection:selection.selection,reason:selection.reason,output:outputMode(model)}));
@@ -42,16 +44,26 @@ export async function run(store: MemoryStore, cfg: MemoriesConfig, llm: Llm, cur
   if (!claims.length) return stats;
 
   const tokenLimit = rolloutTokenLimit(model.contextWindow);
+  const controllers = new Map(claims.map(c => [c.ownershipToken, new AbortController()]));
+  const pending = new Set(claims);
+  const heartbeat = setInterval(() => {
+    for (const c of pending) try {
+      if (!store.heartbeatStage1Job(c.thread.id, c.ownershipToken, STAGE1.JOB_LEASE_SECONDS)) controllers.get(c.ownershipToken)!.abort();
+    } catch { controllers.get(c.ownershipToken)!.abort(); }
+  }, 90_000);
 
   const job = async (claim: Stage1Claim) => {
     const { thread, ownershipToken } = claim;
     try {
       if (signal?.aborted) throw new Error("aborted");
+      if (!store.heartbeatStage1Job(thread.id, ownershipToken, STAGE1.JOB_LEASE_SECONDS)) throw new Error('lost stage1 ownership');
+      const requestSignal = AbortSignal.any([controllers.get(ownershipToken)!.signal, AbortSignal.timeout(55 * 60_000), ...(signal ? [signal] : [])]);
       const r = renderSession(thread.rolloutPath);
       if (r.id !== thread.id) throw new Error("session header identity mismatch");
       const contents = cfg.version === "v2" ? tieredEvidence(r.rows, tokenLimit) : truncateToTokens(r.text, tokenLimit);
       const user = inputTpl.replace("{{ rollout_path }}", () => thread.rolloutPath).replace("{{ rollout_cwd }}", () => thread.cwd).replace("{{ rollout_contents }}", () => contents).replace("{{ rollout_git_branch }}", () => thread.gitBranch ?? "unknown");
-      const res = await complete(llm, model, { systemPrompt: system, messages: cfg.version === "v2" ? evidenceMessages(user) : [{ role: "user", content: [{ type: "text", text: user }], timestamp: Date.now() }] }, cfg.extract_thinking, signal, undefined, cfg.version);
+      const res = await complete(llm, model, { systemPrompt: system, messages: cfg.version === "v2" ? evidenceMessages(user) : [{ role: "user", content: [{ type: "text", text: user }], timestamp: Date.now() }] }, cfg.extract_thinking, requestSignal, undefined, cfg.version);
+      if (requestSignal.aborted || !store.heartbeatStage1Job(thread.id, ownershipToken, STAGE1.JOB_LEASE_SECONDS)) throw new Error('aborted or lost stage1 ownership');
       stats.tokens += usageOf(res).totalTokens ?? 0;
       if (res.stopReason !== "stop") throw new Error(`model stop reason: ${res.stopReason}${res.errorMessage ? ` (${res.errorMessage})` : ""}`);
       const parsed = parseJsonObject(textOf(res));
@@ -64,15 +76,19 @@ export async function run(store: MemoryStore, cfg: MemoriesConfig, llm: Llm, cur
       if (store.markStage1JobSucceeded(thread.id, ownershipToken, Math.floor(thread.updatedAtMs / 1000), raw, summary, slug)) stats.withOutput++; else stats.failed++;
     } catch (e) {
       stats.failed++;
-      const reason = (e as Error).message;
-      log(`phase1: job failed for thread ${thread.id}: ${reason}`);
-      store.markStage1JobFailed(thread.id, ownershipToken, reason, STAGE1.JOB_RETRY_DELAY_SECONDS);
-    }
+      const reason = redact(e instanceof Error ? e.message : String(e));
+      report(`phase1: job failed for thread ${thread.id}: ${reason}`);
+      try { store.markStage1JobFailed(thread.id, ownershipToken, reason, STAGE1.JOB_RETRY_DELAY_SECONDS); }
+      catch { report(`phase1: could not persist failure for ${thread.id}; lease recovery required`); }
+    } finally { pending.delete(claim); }
   };
   const q = [...claims];
-  await Promise.all(Array.from({ length: Math.min(STAGE1.CONCURRENCY_LIMIT, q.length) }, async () => { while (q.length && !signal?.aborted) await job(q.shift()!); }));
-  // Claims left unprocessed on abort: release so the next startup can retry immediately.
-  for (const c of q) store.markStage1JobFailed(c.thread.id, c.ownershipToken, "aborted before start", 0);
-  log(`phase1: ${stats.claimed} claimed, ${stats.withOutput} with output, ${stats.noOutput} no output, ${stats.failed} failed, ${stats.tokens} tokens`);
+  try { await Promise.allSettled(Array.from({ length: Math.min(STAGE1.CONCURRENCY_LIMIT, q.length) }, async () => { while (q.length && !signal?.aborted) await job(q.shift()!); })); }
+  finally {
+    clearInterval(heartbeat);
+    for (const c of q) try { if (store.releaseStage1Job(c.thread.id, c.ownershipToken)) stats.released++; else stats.failed++; }
+    catch { stats.failed++; report(`phase1: could not release ${c.thread.id}; lease recovery required`); }
+  }
+  report(`phase1: ${stats.claimed} claimed, ${stats.withOutput} with output, ${stats.noOutput} no output, ${stats.failed} failed, ${stats.released} released, ${stats.tokens} tokens`);
   return stats;
 }

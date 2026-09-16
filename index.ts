@@ -7,7 +7,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { redact } from "./safety.js";
+import { redact, atomicWrite } from "./safety.js";
+import { createHash } from 'node:crypto';
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CONFIG_FILE, memoryRootFor, memoryDbFor, ensureConfigFile, migrateLegacyConfig, loadConfig, saveConfig, type MemoriesConfig, type MemoryVersion } from "./src/config.ts";
 import { MemoryStore } from "./src/store.ts";
@@ -21,6 +22,7 @@ import { buildDeveloperInstructions, extractCitationBlocks, memoryTools, parseMe
 
 const PROMPTS = path.join(path.dirname(fileURLToPath(import.meta.url)), "prompts");
 const LOG_FILE = path.join(memoryRootFor("v1"), "..", "memories.log");
+const POLLUTION_DIR = path.join(path.dirname(memoryRootFor('v1')), 'memory-polluted-threads');
 // Tools whose output is external context (codex: web search / image gen / MCP mark the thread polluted).
 const EXTERNAL_CONTEXT_TOOLS = /^(web_search|fetch_content|source_check|get_search_content|ctx_fetch_and_index|image_gen|generate_image|mcp$|mcpScript$|mcp__|mcp_)/;
 
@@ -52,15 +54,20 @@ export default function (pi: ExtensionAPI) {
     const ac = new AbortController();
     const task = (async () => {
       const versions: MemoryVersion[] = cfg.dual_write ? ["v1", "v2"] : [activeVersion];
-      await Promise.all(versions.map(async version => {
+      await Promise.allSettled(versions.map(async version => {
       if (ac.signal.aborted) return;
-      const st = openStore(version), root = memoryRootFor(version), config = { ...cfg, version };
       try {
+        const st = openStore(version), root = memoryRootFor(version), config = { ...cfg, version };
         st.withMutation(() => {
           ensureLayout(root);
           seedExtensionInstructions(root, fs.readFileSync(path.join(PROMPTS, "extensions", "ad_hoc", "instructions.md"), "utf8"));
         });
         const n = indexSessions(t => st.upsertThread(t));
+        if (fs.existsSync(POLLUTION_DIR)) for (const file of fs.readdirSync(POLLUTION_DIR)) {
+          const id: unknown = JSON.parse(fs.readFileSync(path.join(POLLUTION_DIR, file), 'utf8'));
+          if (typeof id !== 'string') throw new Error('invalid pollution exclusion record');
+          st.setThreadMemoryMode(id, 'polluted');
+        }
         st.archiveMissingThreadFiles();
         log(`startup: indexed ${n} session file(s)`);
         phase1.prune(st, config, log);
@@ -122,29 +129,36 @@ export default function (pi: ExtensionAPI) {
   });
 
   // External context → mark this thread polluted so it is never extracted (codex disable_on_external_context).
-  pi.on("tool_execution_end", async (event: any) => {
+  pi.on("tool_execution_end", async event => {
     if (!cfg.enabled || !cfg.disable_on_external_context || !sessionId || isEphemeral) return;
     const name = String(event.toolName ?? "");
     const source = pi.getAllTools?.().find(tool => tool.name === name)?.sourceInfo;
     const mcpSource = source && (source.source.startsWith("mcp:") || /(?:^npm:|[\\/])pi-mcp-adapter(?:@|[\\/]|$)/i.test(source.source) || /[\\/]pi-mcp-adapter[\\/]/i.test(source.path));
     if (EXTERNAL_CONTEXT_TOOLS.test(name) || mcpSource) {
       try {
+        atomicWrite(path.join(POLLUTION_DIR, createHash('sha256').update(sessionId).digest('hex') + '.json'), JSON.stringify(sessionId));
+      } catch (e) {
+        running?.ac.abort(); cfg.enabled = false;
+        log(`pollution exclusion persistence failed; extension disabled: ${String(e)}`);
+        throw e;
+      }
         for (const version of ["v1", "v2"] as const) {
+          try {
           const st = openStore(version);
           if (sessionFile) { const h = readSessionHeader(sessionFile, Date.now()); if (h) st.upsertThread({ id: h.id, rolloutPath: h.file, cwd: h.cwd, updatedAtMs: h.mtimeMs, memoryMode: "enabled", gitBranch: null }); }
           if (st.setThreadMemoryMode(sessionId, "polluted")) log(`thread ${sessionId} marked polluted (${version}) by ${event.toolName}`);
+          } catch (e) { log(`pollution mark failed (${version}); durable exclusion retained: ${String(e)}`); }
         }
-      } catch (e) { log(`pollution mark failed: ${e}`); }
     }
   });
 
   // Citations in each completed assistant message → usage_count / last_usage.
   // message_end fires once per finalized message: the analogue of Codex record_completed_response_item.
-  pi.on("message_end", async (event: any) => {
+  pi.on("message_end", async event => {
     if (!cfg.enabled) return;
     const last = event.message;
     if (!last || last.role !== "assistant") return;
-    const text = (Array.isArray(last.content) ? last.content : []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n");
+    const text = last.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
     if (!cfg.use_memories) return;
     const blocks = extractCitationBlocks(text); if (!blocks.length) return;
     const cit = parseMemoryCitation(blocks); if (!cit) return;

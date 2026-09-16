@@ -30,7 +30,7 @@ function parseEntry(line: string): CitationEntry | undefined {
   const match = line.trim().match(/^(.*):(\d+)\s*-\s*(\d+)\|note=\[(.*)\]$/);
   if (!match) return undefined;
   const s = Number(match[2]), e = Number(match[3]);
-  if (!Number.isSafeInteger(s) || !Number.isSafeInteger(e)) return undefined;
+  if (!match[1].trim() || !Number.isSafeInteger(s) || !Number.isSafeInteger(e) || s < 1 || e < s) return undefined;
   return { path: match[1].trim(), lineStart: s, lineEnd: e, note: match[4].trim() };
 }
 export function parseMemoryCitation(texts: string[]): MemoryCitation | undefined {

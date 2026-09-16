@@ -6,15 +6,16 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { WORKSPACE_DIFF } from "./config.ts";
 import { ensureLayout } from "./storage.ts";
+import { assertTrustedPath, atomicWrite } from "../safety.js";
 
 export type Change = { status: "added" | "modified" | "deleted" | "renamed" | "typechange" | "unknown"; path: string };
-export type BaselineDiff = { changes: Change[]; unifiedDiff: string };
+export type BaselineDiff = { changes: Change[]; unifiedDiff: string; diffTruncated?: boolean };
 
-const GIT_ENV = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null", HOME: process.env.HOME ?? process.env.USERPROFILE ?? "" };
+const gitEnv = () => ({ ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith('GIT_'))), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: process.platform === 'win32' ? 'NUL' : '/dev/null', GIT_ATTR_NOSYSTEM: '1' });
 const IDENT = ["-c", "user.name=pi-codex-memory", "-c", "user.email=memory@localhost", "-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"];
 
-function git(root: string, args: string[], opts: { allowFail?: boolean } = {}) {
-  const r = spawnSync("git", [...IDENT, ...args], { cwd: root, encoding: "utf8", env: GIT_ENV, maxBuffer: 64 * 1024 * 1024 });
+function git(root: string, args: string[], opts: { allowFail?: boolean; gitDir?: string } = {}) {
+  const r = spawnSync("git", ['--git-dir', opts.gitDir ?? path.join(root, '.git'), '--work-tree', root, ...IDENT, ...args], { cwd: root, encoding: "utf8", env: gitEnv(), timeout: 120000, maxBuffer: 64 * 1024 * 1024 });
   if (r.error) throw r.error;
   if (r.status !== 0 && !opts.allowFail) throw new Error(`git ${args[0]} failed: ${(r.stderr || r.stdout).trim()}`);
   return r;
@@ -27,15 +28,55 @@ export function gitAvailable(): boolean {
 
 function baselineUsable(root: string): boolean {
   if (!fs.existsSync(path.join(root, ".git"))) return false;
+  validateRepository(root);
   return git(root, ["rev-parse", "--verify", "HEAD"], { allowFail: true }).status === 0;
 }
 
+const ownedMarker = 'pi-codex-memory-owned';
+const paths = ['.', ':(exclude).git*', ':(exclude).memory-*', `:(exclude)${WORKSPACE_DIFF.FILENAME}`];
+function validateRepository(root: string, gitDir = path.join(root, '.git')) {
+  assertTrustedPath(root);
+  const stack = [gitDir];
+  while (stack.length) {
+    const current = stack.pop()!, stat = fs.lstatSync(current);
+    if (stat.isSymbolicLink() || (stat.isFile() && stat.nlink > 1)) throw new Error('unsafe Git repository link');
+    if (current === gitDir && !stat.isDirectory()) throw new Error('Git indirection is not allowed');
+    if (stat.isDirectory()) for (const name of fs.readdirSync(current)) stack.push(path.join(current, name));
+  }
+  for (const f of ['commondir', 'objects/info/alternates']) if (fs.existsSync(path.join(gitDir, f))) throw new Error('external Git storage is not allowed');
+  const config = git(root, ['config', '--no-includes', '--file', path.join(gitDir, 'config'), '--list'], { gitDir }).stdout;
+  for (const line of config.trim().split('\n').filter(Boolean)) {
+    if (!/^core\.(repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|symlinks|precomposeunicode)=/i.test(line)) throw new Error('untrusted local Git configuration');
+    if (/^core\.bare=/i.test(line) && line !== 'core.bare=false') throw new Error('bare Git workspace is not allowed');
+  }
+  const marker = path.join(gitDir, ownedMarker);
+  if (fs.existsSync(marker)) {
+    if (fs.readFileSync(marker, 'utf8') !== fs.realpathSync(root)) throw new Error('foreign memory baseline');
+  } else {
+    // Adopt only the exact single-commit baseline produced by versions <= 0.2.1.
+    const identity = git(root, ['log', '-1', '--format=%an%n%ae%n%s'], { gitDir }).stdout.trim();
+    if (identity !== 'pi-codex-memory\nmemory@localhost\nmemory baseline' || git(root, ['rev-list', '--count', 'HEAD'], { gitDir }).stdout.trim() !== '1') throw new Error('repository is not an owned memory baseline');
+    fs.writeFileSync(marker, fs.realpathSync(root), { flag: 'wx' });
+  }
+}
+
 function initBaseline(root: string) {
-  fs.rmSync(path.join(root, ".git"), { recursive: true, force: true });
-  git(root, ["init", "-q"]);
-  fs.writeFileSync(path.join(root, ".git", "info", "exclude"), `${WORKSPACE_DIFF.FILENAME}\n`);
-  git(root, ["add", "-A", "--", "."]);
-  git(root, ["commit", "-q", "--allow-empty", "-m", "memory baseline"]);
+  const current = path.join(root, '.git'), next = path.join(root, '.git-next'), previous = path.join(root, '.git-previous');
+  if (fs.existsSync(current)) validateRepository(root);
+  if (fs.existsSync(next) || fs.existsSync(previous)) throw new Error('unfinished baseline replacement; preserve .git-next/.git-previous for recovery');
+  let moved = false;
+  try {
+    git(root, ['init', '-q', '--template='], { gitDir: next });
+    // init under a non-.git dir records core.worktree; every command passes --work-tree, so drop it to keep config minimal.
+    git(root, ['config', '--file', path.join(next, 'config'), '--unset', 'core.worktree'], { gitDir: next, allowFail: true });
+    fs.writeFileSync(path.join(next, ownedMarker), fs.realpathSync(root));
+    git(root, ['add', '-f', '-A', '--', ...paths], { gitDir: next });
+    git(root, ['commit', '-q', '--allow-empty', '-m', 'memory baseline'], { gitDir: next });
+    if (fs.existsSync(current)) { fs.renameSync(current, previous); moved = true; }
+    try { fs.renameSync(next, current); }
+    catch (e) { if (moved) fs.renameSync(previous, current); throw e; }
+    if (moved) fs.rmSync(previous, { recursive: true });
+  } finally { if (fs.existsSync(next)) fs.rmSync(next, { recursive: true }); }
 }
 
 /** prepare_memory_workspace: ensure layout, drop stale diff artifact, ensure usable baseline. */
@@ -51,18 +92,30 @@ export function removeWorkspaceDiff(root: string) {
 
 /** diff_since_latest_init: status + unified diff of worktree vs. the single baseline commit. */
 export function memoryWorkspaceDiff(root: string): BaselineDiff {
+  validateRepository(root);
   removeWorkspaceDiff(root);
-  git(root, ["add", "-A", "-N", "--", "."]); // intent-to-add so untracked files show in diff
-  const status = git(root, ["status", "--porcelain=v1", "--untracked-files=all", "--", "."]).stdout;
+  git(root, ["add", "-f", "-A", "-N", "--", ...paths]);
+  const status = git(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ...paths]).stdout;
   const changes: Change[] = [];
-  for (const line of status.split("\n")) {
-    if (!line.trim()) continue;
-    const code = line.slice(0, 2), file = line.slice(3).replace(/^"|"$/g, "");
-    const s: Change["status"] = /A|\?/.test(code) ? "added" : /D/.test(code) ? "deleted" : /R/.test(code) ? "renamed" : /T/.test(code) ? "typechange" : /M/.test(code) ? "modified" : "unknown";
-    changes.push({ status: s, path: file.includes(" -> ") ? file.split(" -> ")[1] : file });
+  const records = status.split('\0');
+  for (let i = 0; i < records.length; i++) {
+    const line = records[i]; if (!line) continue;
+    const code = line.slice(0, 2), file = line.slice(3);
+    let s: Change['status'] = 'unknown';
+    if (/R|C/.test(code)) { s = 'renamed'; i++; }
+    else if (/A|\?/.test(code)) s = 'added';
+    else if (/D/.test(code)) s = 'deleted';
+    else if (/T/.test(code)) s = 'typechange';
+    else if (/M/.test(code)) s = 'modified';
+    changes.push({ status: s, path: file });
   }
-  const unifiedDiff = changes.length ? git(root, ["diff", "--no-color", "--no-ext-diff", "HEAD", "--", "."]).stdout : "";
-  return { changes, unifiedDiff };
+  if (!changes.length) return { changes, unifiedDiff: '' };
+  // A child drains Git stdout while retaining only the bounded prefix. No giant parent buffer.
+  const script = `const {spawn}=require('node:child_process');let input='';process.stdin.on('data',d=>input+=d);process.stdin.on('end',()=>{const {args,limit}=JSON.parse(input);const p=spawn('git',args);let chunks=[],size=0,truncated=false,error='';p.stdout.on('data',b=>{const n=Math.min(b.length,limit-size);if(n)chunks.push(b.subarray(0,n));size+=n;if(n<b.length)truncated=true;});p.stderr.on('data',b=>{error=(error+b).slice(0,4096);});p.on('error',e=>{process.stderr.write(e.message);process.exitCode=1;});p.on('close',code=>{if(code!==0){process.stderr.write(error);process.exitCode=1;}else process.stdout.write(JSON.stringify({text:Buffer.concat(chunks).toString('utf8'),truncated}));});});`;
+  const result = spawnSync(process.execPath, ['-e', script], { cwd: root, env: gitEnv(), input: JSON.stringify({ args: ['--git-dir', path.join(root, '.git'), '--work-tree', root, ...IDENT, 'diff', '--no-color', '--no-ext-diff', '--no-textconv', 'HEAD', '--', ...paths], limit: WORKSPACE_DIFF.MAX_BYTES }), encoding: 'utf8', timeout: 120000, maxBuffer: WORKSPACE_DIFF.MAX_BYTES * 6 + 65536 });
+  if (result.error || result.status !== 0) throw result.error ?? new Error(result.stderr);
+  const captured: { text: string; truncated: boolean } = JSON.parse(result.stdout);
+  return { changes, unifiedDiff: captured.text.replace(/\uFFFD+$/, ''), diffTruncated: captured.truncated };
 }
 
 export function renderWorkspaceDiffFile(diff: BaselineDiff): string {
@@ -70,7 +123,7 @@ export function renderWorkspaceDiffFile(diff: BaselineDiff): string {
   if (!diff.changes.length) return out + "- none\n";
   for (const c of diff.changes) out += `- ${c.status} ${c.path}\n`;
   out += "\n## Diff\n\n```diff\n";
-  if (Buffer.byteLength(diff.unifiedDiff) <= WORKSPACE_DIFF.MAX_BYTES) {
+  if (!diff.diffTruncated && Buffer.byteLength(diff.unifiedDiff) <= WORKSPACE_DIFF.MAX_BYTES) {
     out += diff.unifiedDiff.endsWith("\n") || !diff.unifiedDiff ? diff.unifiedDiff : diff.unifiedDiff + "\n";
   } else {
     out += Buffer.from(diff.unifiedDiff).subarray(0, WORKSPACE_DIFF.MAX_BYTES).toString("utf8").replace(/\uFFFD+$/, "") + `\n\n[workspace diff truncated at ${WORKSPACE_DIFF.MAX_BYTES} bytes]\n`;
@@ -79,7 +132,7 @@ export function renderWorkspaceDiffFile(diff: BaselineDiff): string {
 }
 
 export function writeWorkspaceDiff(root: string, diff: BaselineDiff) {
-  fs.writeFileSync(path.join(root, WORKSPACE_DIFF.FILENAME), renderWorkspaceDiffFile(diff));
+  atomicWrite(path.join(root, WORKSPACE_DIFF.FILENAME), renderWorkspaceDiffFile(diff));
 }
 
 /** reset_git_repository: remove the diff artifact, then re-create the repo with one commit. */

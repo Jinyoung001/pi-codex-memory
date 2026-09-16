@@ -64,6 +64,6 @@ test('packed package loads from a Unicode/spaced path with isolated state and ru
       assert.equal(completed.completed,true);
       console.log('isolated packaged V1/V2 smoke passed');
     `;
-    assert.match(run(process.execPath, ['--experimental-strip-types', '--no-warnings', '--input-type=module', '-e', code], { env: { ...process.env, PCM_PACKAGE_ROOT: pkg, PI_CODEX_MEMORY_HOME: path.join(temp, 'state'), PI_CODEX_MEMORY_SESSIONS: path.join(temp, 'sessions') } }), /smoke passed/);
+    assert.match(run(process.execPath, ['--experimental-strip-types', '--no-warnings', '--input-type=module', '-e', code], { cwd: temp, env: { ...process.env, PCM_PACKAGE_ROOT: pkg, PI_CODEX_MEMORY_HOME: path.join(temp, 'state'), PI_CODEX_MEMORY_SESSIONS: path.join(temp, 'sessions') } }), /smoke passed/);
   } finally { fs.rmSync(temp, { recursive: true, force: true }); }
 });

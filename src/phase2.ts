@@ -11,6 +11,7 @@ import { extensionsRoot, pruneOldExtensionResources, rebuildRawMemoriesFile, rem
 import { memoryWorkspaceDiff, prepareMemoryWorkspace, resetMemoryWorkspaceBaseline, writeWorkspaceDiff } from "./workspace.ts";
 import type { MemoryStore, Stage1Output } from "./store.ts";
 import type { Log } from "./phase1.ts";
+import { redact } from '../safety.js';
 
 const PROMPTS = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "prompts");
 
@@ -66,21 +67,31 @@ When everything is written, finish with your final response.`;
 export type Phase2Result = "claimed_failed" | "skipped_running" | "skipped_cooldown" | "skipped_retry_unavailable" | "succeeded_no_workspace_changes" | "succeeded" | `failed_${string}`;
 
 export async function run(store: MemoryStore, cfg: MemoriesConfig, llm: Llm, root: string, workerId: string, log: Log, opts: { force?: boolean; signal?: AbortSignal; onProgress?: (s: string) => void } = {}): Promise<Phase2Result> {
+  if (opts.signal?.aborted) return 'failed_aborted';
+  let ownedToken: string | undefined;
+  const report: Log = message => { try { log(redact(message)); } catch {} };
+  const fail = (reason: string): Phase2Result => {
+    reason = redact(reason); report(`phase2: ${reason}`);
+    try { if (ownedToken) store.markGlobalPhase2JobFailed(ownedToken, reason, STAGE2.JOB_RETRY_DELAY_SECONDS); } catch { report('phase2: failure persistence unavailable; lease recovery required'); }
+    return `failed_${reason}`;
+  };
+  try {
   // 1. Claim global lock.
   const claim = store.tryClaimGlobalPhase2Job(workerId, STAGE2.JOB_LEASE_SECONDS, { ignoreCooldown: opts.force });
   if (claim.outcome !== "claimed") return claim.outcome;
   const token = claim.ownershipToken;
+  ownedToken = token;
   const guarded = <T>(fn: () => T): T => store.withMutation(() => {
+    if (opts.signal?.aborted) throw new Error('aborted');
     if (!store.heartbeatGlobalPhase2Job(token, STAGE2.JOB_LEASE_SECONDS)) throw new Error("lost phase2 ownership");
     return fn();
   });
-  const fail = (reason: string): Phase2Result => { log(`phase2: ${reason}`); store.markGlobalPhase2JobFailed(token, reason, STAGE2.JOB_RETRY_DELAY_SECONDS); return `failed_${reason}` as Phase2Result; };
 
   // 2. Git baseline.
   try { guarded(() => prepareMemoryWorkspace(root)); } catch (e) { return fail(`prepare_workspace: ${(e as Error).message}`); }
 
   // 3. Agent config: model must resolve before we mutate anything.
-  let model: any;
+  let model: ReturnType<typeof resolveMemoryModel>['model'];
   try { const selection=resolveMemoryModel(llm,cfg.consolidation_model); model=selection.model; store.setSetting("runtime:consolidation",JSON.stringify({model:`${model.provider}/${model.id}`,selection:selection.selection,reason:selection.reason})); } catch (e) { return fail(`agent_config: ${(e as Error).message}`); }
 
   // 4. Load inputs.
@@ -93,9 +104,10 @@ export async function run(store: MemoryStore, cfg: MemoriesConfig, llm: Llm, roo
   catch (e) { return fail(`sync_workspace_inputs: ${(e as Error).message}`); }
 
   // 6. Diff decides whether the agent runs.
-  let diff; try { diff = memoryWorkspaceDiff(root); } catch (e) { return fail(`workspace_status: ${(e as Error).message}`); }
+  let diff; try { diff = guarded(() => memoryWorkspaceDiff(root)); } catch (e) { return fail(`workspace_status: ${(e as Error).message}`); }
   let artifactsValid = true; try { guarded(() => validateConsolidationArtifacts(root, cfg.version)); } catch { artifactsValid = false; }
   if (!diff.changes.length && artifactsValid && !opts.force) {
+    if (opts.signal?.aborted) return fail('aborted');
     if (!store.markGlobalPhase2JobSucceeded(token, newWatermark, selected)) return "failed_lost_ownership";
     return "succeeded_no_workspace_changes";
   }
@@ -104,7 +116,7 @@ export async function run(store: MemoryStore, cfg: MemoriesConfig, llm: Llm, roo
   try { guarded(() => writeWorkspaceDiff(root, diff)); } catch (e) { return fail(`workspace_diff_file: ${(e as Error).message}`); }
 
   // 8+9. Run agent with heartbeats.
-  const hb = setInterval(() => { try { if (!store.heartbeatGlobalPhase2Job(token, STAGE2.JOB_LEASE_SECONDS)) { log("phase2: lost lease during heartbeat"); ac.abort(); } } catch (e) { log(`phase2: heartbeat failed: ${(e as Error).message}`); ac.abort(); } }, STAGE2.JOB_HEARTBEAT_SECONDS * 1000);
+  const hb = setInterval(() => { try { if (!store.heartbeatGlobalPhase2Job(token, STAGE2.JOB_LEASE_SECONDS)) { report("phase2: lost lease during heartbeat"); ac.abort(); } } catch (e) { report(`phase2: heartbeat failed: ${String(e)}`); ac.abort(); } }, STAGE2.JOB_HEARTBEAT_SECONDS * 1000);
   const ac = new AbortController();
   const onAbort = () => ac.abort(); opts.signal?.addEventListener("abort", onAbort);
   if (opts.signal?.aborted) ac.abort();
@@ -112,8 +124,9 @@ export async function run(store: MemoryStore, cfg: MemoriesConfig, llm: Llm, roo
   try {
     const r = await runConsolidationAgent(llm, model, cfg, root, log, ac.signal, opts.onProgress, guarded);
     completed = r.completed; agentError = r.error ?? "";
-  } catch (e) { agentError = (e as Error).message; }
+  } catch (e) { agentError = e instanceof Error ? e.message : String(e); }
   finally { clearInterval(hb); opts.signal?.removeEventListener("abort", onAbort); }
+  if (opts.signal?.aborted || ac.signal.aborted) return fail('aborted');
 
   if (!completed) { try { guarded(() => removeMemorySymlinks(root)); } catch {} return fail(`agent: ${agentError || "did not complete"}`); }
   try { guarded(() => validateConsolidationArtifacts(root, cfg.version)); } catch (e) { return fail(`invalid_artifacts: ${(e as Error).message}`); }
@@ -121,8 +134,9 @@ export async function run(store: MemoryStore, cfg: MemoriesConfig, llm: Llm, roo
   try { guarded(() => resetMemoryWorkspaceBaseline(root)); } catch (e) { return fail(`workspace_commit: ${(e as Error).message}`); }
   if (!store.markGlobalPhase2JobSucceeded(token, newWatermark, selected)) return "failed_lost_ownership";
   return "succeeded";
+  } catch (e) { return fail(e instanceof Error ? e.message : String(e)); }
 }
 
-async function runConsolidationAgent(llm: Llm, model: any, cfg: MemoriesConfig, root: string, log: Log, signal: AbortSignal, onProgress: ((s: string) => void) | undefined, guarded: <T>(fn: () => T) => T): Promise<{ completed: boolean; error?: string }> {
+async function runConsolidationAgent(llm: Llm, model: ReturnType<typeof resolveMemoryModel>['model'], cfg: MemoriesConfig, root: string, log: Log, signal: AbortSignal, onProgress: ((s: string) => void) | undefined, guarded: <T>(fn: () => T) => T): Promise<{ completed: boolean; error?: string }> {
   return runPiConsolidationSession(llm,model,cfg,root,buildConsolidationPrompt(root,cfg.version)+HARNESS_NOTE(root),`Begin. Read ${WORKSPACE_DIFF.FILENAME} first.`,signal,guarded,onProgress);
 }

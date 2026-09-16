@@ -172,17 +172,20 @@ INSERT OR IGNORE INTO consolidation_progress(singleton) VALUES(1);
     for (const c of candidates) {
       if (claims.length >= p.maxClaimed) break;
       const thread: ThreadRow = { id: c.id, rolloutPath: c.rollout_path, cwd: c.cwd, updatedAtMs: c.updated_at_ms, memoryMode: c.memory_mode, gitBranch: c.git_branch };
-      const token = this.tryClaimStage1Job(thread, p.currentThreadId, p.leaseSeconds, p.maxClaimed);
+      const token = this.tryClaimStage1Job(thread, p.currentThreadId, p.leaseSeconds, p.maxClaimed, maxAgeCutoff, idleCutoff);
       if (token) claims.push({ thread, ownershipToken: token });
     }
     return claims;
   }
 
-  private tryClaimStage1Job(thread: ThreadRow, workerId: string, leaseSeconds: number, maxRunning: number): string | null {
+  private tryClaimStage1Job(thread: ThreadRow, workerId: string, leaseSeconds: number, maxRunning: number, maxAgeCutoff: number, idleCutoff: number): string | null {
     const t = now(), leaseUntil = t + leaseSeconds, token = randomUUID();
-    const watermark = Math.floor(thread.updatedAtMs / 1000);
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      const current = this.db.prepare(`SELECT id, rollout_path, cwd, updated_at_ms, memory_mode, git_branch FROM threads WHERE id=? AND id!=? AND memory_mode='enabled' AND source='interactive' AND archived=0 AND updated_at_ms>=? AND updated_at_ms<=?`).get(thread.id, workerId, maxAgeCutoff, idleCutoff) as { id: string; rollout_path: string; cwd: string; updated_at_ms: number; memory_mode: ThreadRow['memoryMode']; git_branch: string | null } | undefined;
+      if (!current) { this.db.exec('COMMIT'); return null; }
+      Object.assign(thread, { rolloutPath: current.rollout_path, cwd: current.cwd, updatedAtMs: current.updated_at_ms, memoryMode: current.memory_mode, gitBranch: current.git_branch });
+      const watermark = Math.floor(thread.updatedAtMs / 1000);
       const active = this.db.prepare(`SELECT COUNT(*) AS n FROM jobs WHERE kind=? AND status='running' AND lease_until > ?`).get(JOB_STAGE1, t) as any;
       if (active.n >= maxRunning) { this.db.exec("COMMIT"); return null; }
       // Up to date already?
@@ -246,6 +249,14 @@ INSERT OR IGNORE INTO consolidation_progress(singleton) VALUES(1);
     const t = now();
     return this.db.prepare(`UPDATE jobs SET status='error', finished_at=?, lease_until=NULL, retry_at=?, retry_remaining=MAX(retry_remaining - 1, 0), last_error=?
       WHERE kind=? AND job_key=? AND status='running' AND ownership_token=?`).run(t, t + retryDelaySeconds, reason.slice(0, 500), JOB_STAGE1, threadId, token).changes > 0;
+  }
+
+  heartbeatStage1Job(threadId: string, token: string, leaseSeconds: number): boolean {
+    return this.db.prepare(`UPDATE jobs SET lease_until=? WHERE kind=? AND job_key=? AND status='running' AND ownership_token=? AND EXISTS(SELECT 1 FROM threads WHERE id=? AND memory_mode='enabled' AND source='interactive' AND archived=0)`).run(now() + leaseSeconds, JOB_STAGE1, threadId, token, threadId).changes > 0;
+  }
+
+  releaseStage1Job(threadId: string, token: string): boolean {
+    return this.db.prepare(`UPDATE jobs SET status='pending', lease_until=NULL, ownership_token=NULL, retry_at=NULL WHERE kind=? AND job_key=? AND status='running' AND ownership_token=?`).run(JOB_STAGE1, threadId, token).changes > 0;
   }
 
   deleteThreadMemory(threadId: string) {

@@ -40,11 +40,14 @@ test('atomic writes replace complete files without leaving temp artifacts', t =>
 test('read boundary rejects traversal, sibling prefixes and non-memory state', t => {
   const base = fixture(t), root = path.join(base, 'memories');
   atomicWrite(path.join(root, 'MEMORY.md'), 'ok');
+  atomicWrite(path.join(root, 'state.json'), '{}');
   atomicWrite(path.join(base, 'memories-other', 'secret.md'), 'secret');
   assert.equal(memoryPath(root, 'MEMORY.md'), fs.realpathSync(path.join(root, 'MEMORY.md')));
   for (const p of ['../memories-other/secret.md', '..\\memories-other\\secret.md', 'state.json', 'C:/secrets.md']) {
-    assert.throws(() => memoryPath(root, p));
+    assert.throws(() => memoryPath(root, p), /Invalid memory path|Path outside memory root|ENOENT/);
   }
+  for (const p of ['state.json', 'C:/secrets.md']) assert.throws(() => memoryPath(root, p), /Invalid memory path/);
+  assert.throws(() => markdownFiles(root, '../memories-other'), /Invalid memory directory/);
 });
 test('junctions are neither listed nor readable', t => {
   const base = fixture(t), root = path.join(base, 'memories'), outside = path.join(base, 'outside');
@@ -52,10 +55,12 @@ test('junctions are neither listed nor readable', t => {
   atomicWrite(path.join(outside, 'secret.md'), 'secret');
   fs.symlinkSync(outside, path.join(root, 'escape'), process.platform === 'win32' ? 'junction' : 'dir');
   assert.deepEqual(markdownFiles(root), ['MEMORY.md']);
+  assert.throws(() => markdownFiles(root, 'escape'), /Symlink/);
+  assert.throws(() => markdownFiles(root, 'escape/nested'), /Symlink/);
   assert.throws(() => memoryPath(root, 'escape/secret.md'));
 });
 test('redaction removes credential values without callback-offset leakage', () => {
-  for (const secret of ['sk-abcdefghijklmnopqrstuvwxyz123', 'ghp_abcdefghijklmnopqrstuvwxyz123', 'github_pat_abcdefghijklmnopqrstuvwxyz123']) {
+  for (const secret of ['sk-abcdefghijklmnopqrst_PRIVATE_SUFFIX', 'sk-abcdefghijklmnopqrst-private-suffix_', 'sk-abcdefghijklmnopqrstuvwxyz123', 'ghp_abcdefghijklmnopqrstuvwxyz123', 'github_pat_abcdefghijklmnopqrstuvwxyz123']) {
     const result = redact(`prefix ${secret} suffix`);
     assert.equal(result, 'prefix [REDACTED_SECRET] suffix');
   }

@@ -1,6 +1,6 @@
 {
   "name": "pi-codex-memory",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Port of OpenAI Codex memories (two-phase extraction + consolidation, SQLite jobs, git-baseline workspace, read-path injection, citations) for the pi coding agent",
   "type": "module",
   "main": "index.ts",

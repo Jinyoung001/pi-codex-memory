@@ -59,7 +59,29 @@ Saved in `~/.pi/agent/memories.json`:
 }
 ```
 
-`tool_result_token_budget` is a host addition (not in Codex): before extraction, each tool result in a rollout is capped to this many tokens (errors get 3x), runs of identical lines are folded, and repeated identical results are replaced by a back-reference. User and assistant text is never altered. `0` disables it. On local sessions this cut rendered rollouts by ~35% at 1000 and ~47% at 500 (`node --experimental-strip-types scripts/bench-compaction.mjs [budget]` measures your own sessions without model calls).
+### Reducing background token cost
+
+Stage 1 re-reads whole rollouts, and on real sessions roughly 70% of a rollout is tool output (file reads, command stdout). Two levers, both dependency-free:
+
+1. **Cheaper model** — `extract_model` / `consolidation_model` (above). This is by far the largest saving.
+2. **`tool_result_token_budget`** (host addition, not in Codex; default `1000`, `0` disables) — before extraction each tool result is capped to this many tokens with head+tail retained (errors keep 3x), runs of identical lines are folded to `[… same line ×N]`, and a repeated identical result becomes `[identical to tool result #N]`. User and assistant text is never altered, so the extractor sees the whole conversation instead of losing its tail to one large file dump.
+
+Measure on your own sessions without any model calls:
+
+```bash
+node --experimental-strip-types --no-warnings scripts/bench-compaction.mjs [budget=1000] [maxSessions=40]
+```
+
+Example from a local machine (5 sessions, 745K rendered tokens, OpenRouter list prices at the time):
+
+| | rendered rollout | sent to stage 1 (150K cap) | stage-1 cost |
+|---|---|---|---|
+| session model (`gpt-6-astra` / `claude-fable-5.1`, $10/$50 per M), raw | 745K | 321K | $3.58 |
+| same model, budget 1000 | 485K (-35%) | 275K (-14%) | $3.12 |
+| `deepseek/deepseek-v4.1-flash` ($0.30/$1.20 per M), raw | 745K | 321K | $0.105 |
+| flash, budget 1000 | 485K | 275K | **$0.092 (×39 cheaper)** |
+
+Budget 500 cuts rendered rollouts by ~47% at the cost of shorter non-error tool output. Sessions already above the 150K cap do not get cheaper — they get a better-balanced input. Set `BENCH_PRICES='{"name":{"in":..,"out":..}}'` to compare other models.
 
 Models accept `provider/model-id`. By default, both stages use the current pi session model (`null`); an explicit setting overrides it for that stage. Codex's preferred models are not selected automatically. Explicit settings fail if unavailable or unauthenticated; request errors never trigger a model switch. `/memories status` shows the last selected provider/model, `session-default` or `explicit`, and extraction output enforcement.
 

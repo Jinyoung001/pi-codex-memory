@@ -1,0 +1,11 @@
+# Current handoff: Codex-only pi memory extension
+
+The user replaced the efficiency experiment with a faithful standalone pi port of OpenAI Codex memory. Pinned commit: 5bf132cd527311eb61bbec46562e3890eb49df80. See README.md and CODEX_PARITY.md for behavior, migration, test coverage and explicit host differences.
+
+Removed the efficient/QMD/FTS/core/delta-tidy path and experimental dependencies. Existing data is preserved; retired config is backed up and migrated on session start. Schema upgrades back up SQLite; legacy failed statuses become error. Consolidation now runs in an isolated pi SDK session through the existing pi registry, with automatic compaction and cancellation, only jailed tools and no ambient extensions/context. Dual-write pipelines dispatch concurrently.
+
+Changes include earlier authorized Codex fixes and the Codex-only port. The user authorized committing, pushing and publishing version 0.2.0; check Git and the npm registry for release status. No personal memory migration has been performed. Development validation uses temporary roots and fixed provider replies. Real provider parity and Codex account/remote services are not claimed.
+
+Remaining-behavior pass: current pi session model by default with explicit per-stage overrides (user-approved host adaptation); strict Responses/Completions JSON Schema via onPayload; local validation on every route; runtime model/output status; no custom done or 60-turn cap. Actual SDK tests cover 65 tool turns, cancellation and real overflow compaction/resume. Normalized evidence keeps pi branch/source/phase metadata without guessing commentary from toolUse. Truncation now uses pinned Codex markers/retained-byte rules for extraction and summary prompts. Removed turn-cap configuration receives a fresh numbered backup when needed. See CODEX_PARITY.md for classifications and source-derived fixtures.
+
+2026-09-16 validation: `npm run check` passed; final `npm test` passed 68/68 (including actual offline npm installation, Jiti-loaded package and SDK run); `git diff --check` passed. HTTP schema checks used localhost, SDK tests used fixed replies, no paid inference. Suite concurrency is 2 to avoid SDK startup contention; package subprocess timeout is 180 seconds. Earlier failed runs were corrected and superseded by the all-green run.

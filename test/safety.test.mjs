@@ -12,6 +12,10 @@ test('vendored prompts match the pinned Codex commit (LF normalized)', () => {
     const text = fs.readFileSync(new URL('../prompts/' + file, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
     assert.equal(createHash('sha256').update(text).digest('hex'), expected, file);
   }
+  for (const [file, reference] of Object.entries(manifest.auditedSources)) {
+    const text = fs.readFileSync(new URL('../vendor/codex/src/' + file, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+    assert.equal(createHash('sha256').update(text).digest('hex'), reference.sha256, file);
+  }
 });
 
 function fixture(t) {
@@ -53,15 +57,25 @@ test('junctions are neither listed nor readable', t => {
 test('redaction removes credential values without callback-offset leakage', () => {
   for (const secret of ['sk-abcdefghijklmnopqrstuvwxyz123', 'ghp_abcdefghijklmnopqrstuvwxyz123', 'github_pat_abcdefghijklmnopqrstuvwxyz123']) {
     const result = redact(`prefix ${secret} suffix`);
-    assert.equal(result, 'prefix [REDACTED] suffix');
+    assert.equal(result, 'prefix [REDACTED_SECRET] suffix');
   }
   assert.equal(redact('postgres://user:password@host/db'), 'postgres://[REDACTED]@host/db');
   assert.equal(redact('mongodb+srv://user:password@host/db'), 'mongodb+srv://[REDACTED]@host/db');
-  assert.equal(redact('Authorization: Bearer abc123'), 'Authorization: [REDACTED] [REDACTED]');
+  assert.equal(redact('Authorization: Bearer abc123'), 'Authorization: Bearer [REDACTED_SECRET]');
   assert.equal(redact('-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----'), '[REDACTED PRIVATE KEY]');
 });
-test('extraction accepts no-op but rejects malformed or partial output', () => {
+test('pinned sanitizer bearer cases redact complete values and avoid prose false positives', () => {
+  for (const input of ['Bearer abcde+fghijklmnopqrstuvwxyz012345', 'Bearer abcdefghijklmnop+secret_suffix', 'Bearer sk-abcdefghijklmnopqrst+secret_suffix', 'Bearer AKIAABCDEFGHIJKLMNOP/~secret_suffix', 'Bearer   abcdefghijklmnop']) {
+    assert.equal(redact(input), 'Bearer [REDACTED_SECRET]');
+  }
+  assert.equal(redact('Bearer AbcdefghijklMN09._~+/-==; echo done'), 'Bearer [REDACTED_SECRET]; echo done');
+  assert.equal(redact('authorization: bEaReR\tabcdefghijklmnop'), 'authorization: Bearer [REDACTED_SECRET]');
+  for (const input of ['Bearer of good news', 'Bearer abcdefghijklmno', 'NotABearer abcdefghijklmnop', 'Bearerabcdefghijklmnop', 'Bearer\nabcdefghijklmnop', 'Bearer\u00a0abcdefghijklmnop', 'Bearer abcdefghijklmno\u212a']) assert.equal(redact(input), input);
+});
+
+test('extraction accepts V1 nullable slug and empty output, rejects malformed objects', () => {
   assert.deepEqual(extractionOutput({ raw_memory: '', rollout_summary: '', rollout_slug: '' }), { raw_memory: '', rollout_summary: '', rollout_slug: '' });
   assert.throws(() => extractionOutput({ raw_memory: {}, rollout_summary: '', rollout_slug: '' }));
-  assert.throws(() => extractionOutput({ raw_memory: 'fact', rollout_summary: '', rollout_slug: '' }));
+  assert.equal(extractionOutput({ raw_memory: 'fact', rollout_summary: '', rollout_slug: null }).rollout_slug, null);
+  assert.throws(() => extractionOutput({ raw_memory: '', rollout_summary: '', extra: true }));
 });

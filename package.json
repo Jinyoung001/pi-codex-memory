@@ -36,20 +36,22 @@
     "url": "git+https://github.com/Jinyoung001/pi-codex-memory.git"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13"
   },
   "scripts": {
     "check": "tsc -p tsconfig.json",
-    "test": "node --experimental-strip-types --no-warnings --test test/*.test.mjs",
+    "test": "node --experimental-strip-types --no-warnings --test --test-concurrency=2 test/*.test.mjs",
     "prepublishOnly": "npm run check && npm test"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.85.0"
+    "@earendil-works/pi-coding-agent": ">=0.85.1"
+  },
+  "dependencies": {
+    "typebox": "^1.0.0"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.85.1",
     "@types/node": "^22",
-    "typebox": "^1.0.0",
     "typescript": "^5"
   }
 }

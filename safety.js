@@ -49,22 +49,29 @@ export function markdownFiles(root, dir = '') {
 
 /** Best effort only: never claim arbitrary secrets can be identified reliably. */
 export function redact(text) {
+  // Pinned codex-secrets sanitizer order and replacement text.
   return text
+    .replace(/\bBearer[ \t]+[A-Za-z0-9._~+/-]{16,}=*/gi, 'Bearer [REDACTED_SECRET]')
+    .replace(/sk-[A-Za-z0-9]{20,}/g, '[REDACTED_SECRET]')
+    .replace(/\bAKIA[0-9A-Z]{16}\b/g, '[REDACTED_SECRET]')
+    .replace(/\b(api[_-]?key|token|secret|password)\b(\s*[:=]\s*)(["']?)[^\s"']{8,}/gi, '$1$2$3[REDACTED_SECRET]')
+    // Keep the port's additional recognizable credential protections.
     .replace(/-----BEGIN (?:[A-Z ]*PRIVATE KEY)-----[\s\S]*?-----END (?:[A-Z ]*PRIVATE KEY)-----/g, '[REDACTED PRIVATE KEY]')
-    .replace(/\b(?:sk-|pk-|rk-|gh[pousr]_|github_pat_|xox[baprs]-|AKIA|AIza)[A-Za-z0-9_-]{16,}\b/g, '[REDACTED]')
+    .replace(/\b(?:sk-|pk-|rk-|gh[pousr]_|github_pat_|xox[baprs]-|AIza)[A-Za-z0-9_-]{16,}\b/g, '[REDACTED_SECRET]')
     .replace(/\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{20,}\b/g, '[REDACTED JWT]')
-    .replace(/\bBearer\s+[^\s"',;]+/gi, 'Bearer [REDACTED]')
-    .replace(/((?:api[_-]?key|token|secret|password|passwd|authorization)["']?\s*[:=]\s*["']?)[^\s"',;]+/gi, '$1[REDACTED]')
+    .replace(/(\bauthorization\s*[:=]\s*)Bearer[ \t]+[^\s"',;]+/gi, '$1Bearer [REDACTED_SECRET]')
+    .replace(/((?:api[_-]?key|token|secret|password|passwd)["']?\s*[:=]\s*["']?)[^\s"',;]+/gi, '$1[REDACTED_SECRET]')
     .replace(/\b((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp):\/\/)[^\s/@]+:[^\s/@]+@/gi, '$1[REDACTED]@');
 }
 
 /** Reject malformed extraction instead of coercing objects to '[object Object]'. */
 export function extractionOutput(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid extraction object');
-  for (const key of ['raw_memory', 'rollout_summary', 'rollout_slug']) {
+  if (Object.keys(value).some(key => !['raw_memory', 'rollout_summary', 'rollout_slug'].includes(key))) throw new Error('Unknown extraction field');
+  for (const key of ['raw_memory', 'rollout_summary']) {
     if (typeof value[key] !== 'string') throw new Error(`Invalid extraction field: ${key}`);
   }
-  if (Boolean(value.raw_memory.trim()) !== Boolean(value.rollout_summary.trim())) throw new Error('Incomplete extraction');
+  if (value.rollout_slug !== undefined && value.rollout_slug !== null && typeof value.rollout_slug !== 'string') throw new Error('Invalid extraction field: rollout_slug');
   return value;
 }
 

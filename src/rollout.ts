@@ -9,8 +9,6 @@ import type { ThreadRow } from "./store.ts";
 
 export type SessionMeta = { id: string; cwd: string; file: string; mtimeMs: number; parentSession?: string };
 
-const BYTES_PER_TOKEN = 4; // codex_utils_output_truncation::approx_bytes_for_tokens
-
 export function listSessionFiles(): { file: string; mtimeMs: number }[] {
   const out: { file: string; mtimeMs: number }[] = [];
   if (!fs.existsSync(SESSIONS_DIR)) return out;
@@ -56,21 +54,23 @@ export function indexSessions(upsert: (t: ThreadRow) => void): number {
 type Part = { type?: string; text?: string; name?: string; arguments?: unknown; thinking?: string };
 
 /** pi custom entries injected by extensions (memory summaries, plan contracts, AGENTS.md) are not user evidence. */
-function isInjectedUserText(text: string): boolean {
-  const t = text.trimStart();
+export function isInjectedUserText(text: string): boolean {
+  const t = text.trim();
   return t.startsWith("# Memories (local recall layer)") || t.startsWith("## Memory\n")
-    || t.startsWith("[PI PLAN MODE CONTRACT") || t.startsWith("# AGENTS.md instructions")
-    || t.startsWith("<skill>") || t.startsWith("<system-reminder>") || t.startsWith("<environment_context>");
+    || t.startsWith("[PI PLAN MODE CONTRACT")
+    || (/^# AGENTS\.md instructions/i.test(t) && /<\/INSTRUCTIONS>$/i.test(t))
+    || (/^<skill>/i.test(t) && /<\/skill>$/i.test(t));
 }
 
-function textOf(content: unknown, opts: { toolCalls: boolean }): string {
-  if (typeof content === "string") return content;
+function textOf(content: unknown, opts: { toolCalls: boolean; user?: boolean }): string {
+  if (typeof content === "string") return opts.user && isInjectedUserText(content) ? "" : content;
   if (!Array.isArray(content)) return "";
   const parts: string[] = [];
   for (const p of content as Part[]) {
     if (!p || typeof p !== "object") continue;
-    if (p.type === "text" && typeof p.text === "string") parts.push(p.text);
+    if (p.type === "text" && typeof p.text === "string" && !(opts.user && isInjectedUserText(p.text))) parts.push(p.text);
     else if (p.type === "image") parts.push("[image omitted]");
+    else if (p.type === "audio") parts.push("[audio omitted]");
     else if (p.type === "toolCall" && opts.toolCalls) parts.push(`[tool_call ${p.name}] ${JSON.stringify(p.arguments ?? {})}`);
     // thinking blocks are never persisted into memory input
   }
@@ -81,7 +81,8 @@ function textOf(content: unknown, opts: { toolCalls: boolean }): string {
  * Walk the active branch of a pi session file (entries form a tree via parentId; the last entry's
  * ancestor chain is the branch the user ended on) and render it as memory-relevant text.
  */
-export function renderSession(file: string): { id: string; cwd: string; text: string } {
+export type Evidence = { id:string; parentId:string|null; branchHead:string|null; role:string; source:string; phase:string|null; message:any };
+export function normalizeSession(file: string): {id:string;cwd:string;evidence:Evidence[]} {
   const raw = fs.readFileSync(file, "utf8");
   let id = "", cwd = "";
   const byId = new Map<string, any>();
@@ -94,39 +95,62 @@ export function renderSession(file: string): { id: string; cwd: string; text: st
     byId.set(e.id, e); last = e;
   }
   // Active branch = chain from last entry to root.
-  const branch: any[] = [];
-  for (let cur = last; cur; cur = cur.parentId ? byId.get(cur.parentId) : null) branch.push(cur);
+  const branch: any[] = [], seen = new Set<string>();
+  for (let cur = last; cur; cur = cur.parentId ? byId.get(cur.parentId) : null) {
+    if (seen.has(cur.id)) throw new Error("cyclic session branch");
+    seen.add(cur.id); branch.push(cur);
+  }
   branch.reverse();
 
-  const out: string[] = [];
-  for (const e of branch) {
-    if (e.type === "custom_message") continue;           // extension-injected context
-    if (e.type === "compaction") continue;               // codex drops Compacted items
-    if (e.type !== "message" || !e.message) continue;
+  const evidence:Evidence[]=branch.filter(e=>e.type==="message"&&e.message).map(e=>({
+    id:e.id,parentId:e.parentId??null,branchHead:last?.id??null,role:e.message.role,
+    source:typeof e.message.source==="string"?e.message.source:typeof e.source==="string"?e.source:"unknown",
+    phase:typeof e.message.phase==="string"?e.message.phase:null,message:e.message,
+  }));
+  return {id,cwd,evidence};
+}
+
+export function renderSession(file: string): { id: string; cwd: string; text: string; rows: string[]; evidence:Evidence[] } {
+  const {id,cwd,evidence}=normalizeSession(file);
+
+  const out: string[] = [], rows: string[] = [];
+  const questions=new Map<string,string>();
+  for (const e of evidence) {
     const m = e.message;
+    const kinds=m.internal_chat_message_metadata_passthrough?.content_item_kinds;
+    const agentKinds=Array.isArray(kinds)&&kinds.some((k:any)=>typeof k==="string"&&k.startsWith("multi_agent."));
     if (m.role === "user") {
-      const t = textOf(m.content, { toolCalls: false });
-      if (!t.trim() || isInjectedUserText(t)) continue;
+      const t = textOf(m.content, { toolCalls: false, user: true });
+      if (!t.trim()) continue;
       out.push(`[human user]\n${t}`);
+      const agent = agentKinds || t.trimStart().startsWith("<subagent_notification>") || /^Message Type:.*\nTask name:.*\nSender:.*\nPayload:\s*(?:\n|$)/.test(t.trimStart());
+      const context = (Array.isArray(kinds)&&kinds.length>0&&kinds.every((k:any)=>typeof k==="string"&&!k.startsWith("user."))) || (Array.isArray(m.content)?m.content:[{text:t}]).some((p:any)=>typeof p.text==="string"&&/^<environment_context>[\s\S]*<\/environment_context>$/i.test(p.text.trim()));
+      rows.push(`[${agent ? "other agent" : context ? "harness context" : "human user"}]\n${t}`);
     } else if (m.role === "assistant") {
       const t = textOf(m.content, { toolCalls: true });
       if (t.trim()) out.push(`[assistant]\n${t}`);
+      const prose = textOf(m.content, { toolCalls: false });
+      // Missing phase stays unknown; upstream assigns non-commentary messages to Final.
+      if (prose.trim()) rows.push(`[${agentKinds?"other agent":e.phase === "commentary" ? "assistant commentary" : "assistant final"}]\n${prose}`);
+      if (Array.isArray(m.content)) for (const part of m.content) {
+        if (part?.type === "toolCall") {
+          if(part.name==="request_user_input"&&(!part.namespace||part.namespace==="functions"))questions.set(part.id,JSON.stringify(part.arguments??{}));
+          rows.push(`[tool call]\n${JSON.stringify({ name: part.name, arguments: part.arguments ?? {} })}`);
+        }
+      }
     } else if (m.role === "toolResult") {
       const t = textOf(m.content, { toolCalls: false });
-      const capped = t.length > 8_000 ? t.slice(0, 8_000) + "\n[... tool output truncated ...]" : t; // ~2k tokens, codex TOOL_OUTPUT_TOKENS
-      out.push(`[tool ${m.toolName}${m.isError ? " (error)" : ""}]\n${capped}`);
+      const row = `[tool ${m.toolName}${m.isError ? " (error)" : ""}]\n${t}`;
+      out.push(row);
+      let human=false;
+      try {const value=JSON.parse(t);human=questions.has(m.toolCallId)&&Object.values(value.answers??{}).some((a:any)=>Array.isArray(a.answers)&&a.answers.some((s:any)=>typeof s==="string"&&s.trim()));}catch{/* ordinary tool output */}
+      if(human){rows.push(`[human user]\nAssistant question: ${questions.get(m.toolCallId)}\nHuman reply: ${t}`);questions.delete(m.toolCallId);}else rows.push(row);
     }
   }
-  return { id, cwd, text: redact(out.join("\n\n")) };
+  return { id, cwd, text: redact(out.join("\n\n")), rows: rows.map(redact), evidence };
 }
 
-/** Head+tail truncation to a token budget (codex truncate_text TruncationPolicy::Tokens). */
-export function truncateToTokens(text: string, tokenLimit: number): string {
-  const max = tokenLimit * BYTES_PER_TOKEN;
-  if (Buffer.byteLength(text) <= max) return text;
-  const head = Math.floor(max * 0.5), tail = max - head;
-  return text.slice(0, head) + "\n[... rollout truncated ...]\n" + text.slice(-tail);
-}
+export { truncateTokens as truncateToTokens } from "./codex-truncate.ts";
 
 export function rolloutTokenLimit(contextWindow: number | undefined): number {
   if (!contextWindow || contextWindow <= 0) return STAGE1.DEFAULT_ROLLOUT_TOKEN_LIMIT;

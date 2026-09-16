@@ -79,6 +79,7 @@ test('phase2 global lock: running lease blocks, cooldown after success, failure 
 });
 
 test('phase2 selection ranks usage then recency, honors max_unused_days, stable thread order', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   const st = openStore(t, tmp(t));
   for (const id of ['z', 'y', 'x']) st.upsertThread(thread(id));
   const p = { currentThreadId: 'self', scanLimit: 100, maxClaimed: 10, maxAgeDays: 30, minIdleHours: 6, leaseSeconds: 3600 };
@@ -143,11 +144,11 @@ test('consolidation tool jail blocks escapes, .git, symlinks, and protected dele
   const outside = path.join(path.dirname(root), 'outside-' + path.basename(root)); fs.mkdirSync(outside); t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
   fs.symlinkSync(outside, path.join(root, 'link'), process.platform === 'win32' ? 'junction' : 'dir');
   const tools = Object.fromEntries(consolidationTools(new RootJail(root)).map(x => [x.def.name, x.run]));
-  await assert.rejects(tools.read({ path: '../secret.md' }));
-  await assert.rejects(tools.read({ path: 'C:/Windows/win.ini' }));
-  await assert.rejects(tools.read({ path: '.git/config' }));
-  await assert.rejects(tools.write({ path: 'link/pwned.md', content: 'x' }));
-  await assert.rejects(tools.delete({ path: 'extensions/ad_hoc/notes/n.md' }));
+  assert.throws(() => tools.read({ path: '../secret.md' }));
+  assert.throws(() => tools.read({ path: 'C:/Windows/win.ini' }));
+  assert.throws(() => tools.read({ path: '.git/config' }));
+  assert.throws(() => tools.write({ path: 'link/pwned.md', content: 'x' }));
+  assert.throws(() => tools.delete({ path: 'extensions/ad_hoc/notes/n.md' }));
   assert.match((await tools.list({ path: '.' })).content[0].text, /MEMORY\.md/);
   assert.doesNotMatch((await tools.list({ path: '.', recursive: true })).content[0].text, /link/);
   await tools.write({ path: 'skills/demo/SKILL.md', content: '---\nname: demo\n---\n' });
@@ -168,7 +169,7 @@ test('renderSession follows the active branch and drops injected/developer conte
   const r = renderSession(f);
   assert.equal(r.id, 'sid'); assert.equal(r.cwd, 'C:/p');
   assert.doesNotMatch(r.text, /injected|abandoned|secret thoughts|abcdefgh12345678/);
-  assert.match(r.text, /\[human user\]\nreal question with token=\[REDACTED\]/);
+  assert.match(r.text, /\[human user\]\nreal question with token=\[REDACTED_SECRET\]/);
   assert.match(r.text, /\[tool_call bash\]/); assert.match(r.text, /\[tool bash\]\nout/);
 });
 
@@ -183,19 +184,24 @@ function fakeRegistry(script) {
 }
 const asst = (text, calls = []) => ({ role: 'assistant', content: [{ type: 'text', text }, ...calls.map((c, k) => ({ type: 'toolCall', id: `c${k}`, name: c.name, arguments: c.args }))], stopReason: 'stop', usage: { totalTokens: 10 } });
 
+test('extraction parses the complete JSON response, not fenced or embedded fragments', () => {
+  assert.deepEqual(phase1.parseJsonObject(' {"rollout_summary":"ok"} '), { rollout_summary: 'ok' });
+  for (const text of ['```json\n{}\n```', 'preface {}', '{} trailing', '{broken', 'sk-private-invalid-json']) assert.throws(() => phase1.parseJsonObject(text), { message: 'invalid extraction JSON' });
+});
+
 test('phase1 + phase2 end-to-end with fake model: extraction stored, agent writes artifacts, baseline reset', { skip: !gitAvailable() }, async t => {
   const dir = tmp(t); const root = path.join(dir, 'memories'); const st = openStore(t, dir);
   const sf = path.join(dir, 's.jsonl');
   fs.writeFileSync(sf, [{ type: 'session', version: 3, id: '01a09d51-f37d-7615-9b9d-7317f66f7b20', cwd: 'C:/p' }, { type: 'message', id: 'u', parentId: null, message: { role: 'user', content: 'x'.repeat(50) } }].map(l => JSON.stringify(l)).join('\n'));
   st.upsertThread({ id: '01a09d51-f37d-7615-9b9d-7317f66f7b20', rolloutPath: sf, cwd: 'C:/p', updatedAtMs: Date.now() - 24 * 3600e3, memoryMode: 'enabled', gitBranch: null });
-  const cfg = { ...DEFAULTS, extract_model: null, consolidation_model: null, consolidation_max_turns: 10 };
+  const cfg = { ...DEFAULTS, extract_model: null, consolidation_model: null };
   const log = [];
   const llm = fakeRegistry([
-    asst('```json\n{"raw_memory":"user prefers pnpm","rollout_summary":"set up repo","rollout_slug":"repo-setup"}\n```'),
+    asst('{"raw_memory":"user prefers pnpm","rollout_summary":"set up repo","rollout_slug":"repo-setup"}'),
     // phase 2 agent: read diff, write both artifacts, done
     asst('', [{ name: 'read', args: { path: 'phase2_workspace_diff.md' } }]),
     asst('', [{ name: 'write', args: { path: 'MEMORY.md', content: '# Task Group: repo\n\nscope: x\napplies_to: cwd=C:/p\n\n## Task 1: setup\n### rollout_summary_files\n- rollout_summaries/x.md\n### keywords\n- pnpm\n' } }, { name: 'write', args: { path: 'memory_summary.md', content: 'v1\n\n## User Profile\nprefers pnpm\n' } }]),
-    asst('', [{ name: 'done', args: { summary: 'wrote memory' } }]),
+    asst('Consolidation complete.'),
   ]);
   const s1 = await phase1.run(st, cfg, llm, 'self', m => log.push(m));
   assert.equal(s1.withOutput, 1);
@@ -209,21 +215,24 @@ test('phase1 + phase2 end-to-end with fake model: extraction stored, agent write
   // second run with nothing new: no agent call, clean success
   const r2 = await phase2.run(st, cfg, llm, root, 'self', m => log.push(m), { force: false });
   assert.equal(r2, 'skipped_cooldown');
+  st.db.prepare("UPDATE jobs SET finished_at=0 WHERE kind='memory_consolidate_global'").run();
+  const noCalls = { ...llm, registry: { ...llm.registry, complete: async () => { throw new Error('clean workspace must not call a model'); } } };
+  assert.equal(await phase2.run(st,cfg,noCalls,root,'self',m=>log.push(m)), 'succeeded_no_workspace_changes');
 });
 
 test('phase2 failure paths: agent that never finishes → failed, baseline preserved, lease released for retry later', { skip: !gitAvailable() }, async t => {
   const dir = tmp(t); const root = path.join(dir, 'memories'); const st = openStore(t, dir);
   st.upsertThread(thread('a')); const [c] = st.claimStage1JobsForStartup({ currentThreadId: 'self', scanLimit: 10, maxClaimed: 10, maxAgeDays: 30, minIdleHours: 6, leaseSeconds: 3600 });
   st.markStage1JobSucceeded('a', c.ownershipToken, sec() - 86400, 'raw', 'sum', null);
-  const cfg = { ...DEFAULTS, consolidation_max_turns: 2 };
-  const llm = fakeRegistry([asst('', [{ name: 'list', args: {} }])]); // loops forever listing
+  const cfg = { ...DEFAULTS };
+  const llm = fakeRegistry([() => { throw new Error('provider failure'); }]);
   const r = await phase2.run(st, cfg, llm, root, 'self', () => {});
   assert.match(r, /^failed_agent/);
-  assert.equal(st.phase2Status().status, 'failed');
+  assert.equal(st.phase2Status().status, 'error');
   assert.ok(fs.existsSync(path.join(root, 'raw_memories.md')), 'synced inputs remain');
   assert.equal(st.tryClaimGlobalPhase2Job('w', 3600).outcome, 'skipped_retry_unavailable');
   // invalid artifacts after "done" → failed_invalid_artifacts
-  const llm2 = fakeRegistry([asst('', [{ name: 'done', args: { summary: 'lied' } }])]);
+  const llm2 = fakeRegistry([asst('Finished without writing required artifacts.')]);
   const r2 = await phase2.run(st, { ...cfg }, llm2, root, 'self', () => {}, { force: true });
   assert.match(r2, /^failed_invalid_artifacts/);
 });

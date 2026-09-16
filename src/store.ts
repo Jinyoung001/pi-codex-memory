@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { redact } from "../safety.js";
 
 const JOB_STAGE1 = "memory_stage1";
 const JOB_PHASE2 = "memory_consolidate_global";
@@ -32,6 +33,8 @@ export type ThreadRow = {
   updatedAtMs: number;
   memoryMode: "enabled" | "disabled" | "polluted";
   gitBranch: string | null;
+  source?: "interactive" | "exec" | "subagent";
+  archived?: boolean;
 };
 
 export type Stage1Claim = { thread: ThreadRow; ownershipToken: string };
@@ -48,11 +51,27 @@ export class MemoryStore {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     this.db = new DatabaseSync(file);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;");
+    const existing = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads'").get();
+    if (existing) {
+      const columns = new Set((this.db.prepare("PRAGMA table_info(threads)").all() as any[]).map(r=>r.name));
+      const progress = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='consolidation_progress'").get();
+      const jobs=this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'").get();
+      const legacyErrors=jobs && this.db.prepare("SELECT 1 FROM jobs WHERE status='failed' LIMIT 1").get();
+      if (!columns.has("source") || !columns.has("archived") || !progress || legacyErrors) {
+        const backup=file+".before-codex-schema.bak";
+        if (!fs.existsSync(backup)) {
+          try { this.db.prepare("VACUUM INTO ?").run(backup); }
+          catch(e) { this.db.close(); throw e; }
+        }
+      }
+    }
     this.migrate();
   }
   close() { this.db.close(); }
 
   private migrate() {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
     this.db.exec(`
 CREATE TABLE IF NOT EXISTS threads (
   id TEXT PRIMARY KEY,
@@ -94,19 +113,44 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_kind_status_retry_lease ON jobs(kind, status, retry_at, lease_until);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS consolidation_progress (singleton INTEGER PRIMARY KEY CHECK(singleton=1), max_thread_count INTEGER NOT NULL DEFAULT 0);
+INSERT OR IGNORE INTO consolidation_progress(singleton) VALUES(1);
 `);
+    const columns = new Set((this.db.prepare("PRAGMA table_info(threads)").all() as any[]).map(row => row.name));
+    if (!columns.has("source")) this.db.exec("ALTER TABLE threads ADD COLUMN source TEXT NOT NULL DEFAULT 'interactive'");
+    if (!columns.has("archived")) this.db.exec("ALTER TABLE threads ADD COLUMN archived INTEGER NOT NULL DEFAULT 0");
+    this.db.exec("UPDATE jobs SET status='error' WHERE status='failed'; COMMIT");
+    } catch (e) { this.db.exec("ROLLBACK"); throw e; }
   }
 
   // ---------- threads (pi has no thread DB; we index session files) ----------
   upsertThread(t: ThreadRow) {
-    this.db.prepare(`INSERT INTO threads (id, rollout_path, cwd, updated_at_ms, git_branch) VALUES (?, ?, ?, ?, ?)
+    this.db.prepare(`INSERT INTO threads (id, rollout_path, cwd, updated_at_ms, git_branch, memory_mode, source, archived) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, 'interactive'), ?)
       ON CONFLICT(id) DO UPDATE SET rollout_path = excluded.rollout_path, cwd = excluded.cwd,
-        updated_at_ms = excluded.updated_at_ms, git_branch = COALESCE(excluded.git_branch, threads.git_branch)`)
-      .run(t.id, t.rolloutPath, t.cwd, t.updatedAtMs, t.gitBranch);
+        updated_at_ms = excluded.updated_at_ms, git_branch = COALESCE(excluded.git_branch, threads.git_branch),
+        source = COALESCE(?, threads.source), archived = excluded.archived`)
+      .run(t.id, t.rolloutPath, t.cwd, t.updatedAtMs, t.gitBranch, t.memoryMode, t.source ?? null, Number(t.archived ?? false), t.source ?? null);
+  }
+  /** Pi deletes sessions rather than archiving them. Keep their evidence, but stop new extraction. */
+  archiveMissingThreadFiles() {
+    const rows = this.db.prepare("SELECT id, rollout_path FROM threads WHERE archived=0").all() as any[];
+    const archive = this.db.prepare("UPDATE threads SET archived=1 WHERE id=?");
+    this.withMutation(() => {
+      for (const row of rows) {
+        try { if (fs.lstatSync(row.rollout_path).isFile()) continue; }
+        catch (e: any) { if (e.code !== "ENOENT" && e.code !== "ENOTDIR") throw e; }
+        archive.run(row.id);
+      }
+    });
   }
   setThreadMemoryMode(id: string, mode: ThreadRow["memoryMode"]) {
     // Mirrors mark_thread_memory_mode_polluted: only escalates, never re-enables a polluted thread implicitly.
-    if (mode === "polluted") return this.db.prepare(`UPDATE threads SET memory_mode = 'polluted' WHERE id = ? AND memory_mode = 'enabled'`).run(id).changes > 0;
+    if (mode === "polluted") {
+      const changed = this.db.prepare(`UPDATE threads SET memory_mode = 'polluted' WHERE id = ? AND memory_mode != 'polluted'`).run(id).changes > 0;
+      const selected = this.db.prepare(`SELECT selected_for_phase2 FROM stage1_outputs WHERE thread_id=?`).get(id) as any;
+      if (selected?.selected_for_phase2) this.enqueueGlobalConsolidation(now());
+      return changed;
+    }
     return this.db.prepare(`UPDATE threads SET memory_mode = ? WHERE id = ?`).run(mode, id).changes > 0;
   }
   threadMemoryMode(id: string): ThreadRow["memoryMode"] | undefined {
@@ -122,34 +166,37 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     const idleCutoff = nowMs - p.minIdleHours * 3600e3;
     const candidates = this.db.prepare(`
       SELECT id, rollout_path, cwd, updated_at_ms, memory_mode, git_branch FROM threads
-      WHERE memory_mode = 'enabled' AND id != ? AND updated_at_ms >= ? AND updated_at_ms <= ?
+      WHERE memory_mode = 'enabled' AND source = 'interactive' AND archived = 0 AND id != ? AND updated_at_ms >= ? AND updated_at_ms <= ?
       ORDER BY updated_at_ms DESC LIMIT ?`).all(p.currentThreadId, maxAgeCutoff, idleCutoff, p.scanLimit) as any[];
     const claims: Stage1Claim[] = [];
     for (const c of candidates) {
       if (claims.length >= p.maxClaimed) break;
       const thread: ThreadRow = { id: c.id, rolloutPath: c.rollout_path, cwd: c.cwd, updatedAtMs: c.updated_at_ms, memoryMode: c.memory_mode, gitBranch: c.git_branch };
-      const token = this.tryClaimStage1Job(thread, p.currentThreadId, p.leaseSeconds);
+      const token = this.tryClaimStage1Job(thread, p.currentThreadId, p.leaseSeconds, p.maxClaimed);
       if (token) claims.push({ thread, ownershipToken: token });
     }
     return claims;
   }
 
-  private tryClaimStage1Job(thread: ThreadRow, workerId: string, leaseSeconds: number): string | null {
+  private tryClaimStage1Job(thread: ThreadRow, workerId: string, leaseSeconds: number, maxRunning: number): string | null {
     const t = now(), leaseUntil = t + leaseSeconds, token = randomUUID();
     const watermark = Math.floor(thread.updatedAtMs / 1000);
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      const active = this.db.prepare(`SELECT COUNT(*) AS n FROM jobs WHERE kind=? AND status='running' AND lease_until > ?`).get(JOB_STAGE1, t) as any;
+      if (active.n >= maxRunning) { this.db.exec("COMMIT"); return null; }
       // Up to date already?
       const out = this.db.prepare(`SELECT source_updated_at FROM stage1_outputs WHERE thread_id = ?`).get(thread.id) as any;
-      const job = this.db.prepare(`SELECT status, lease_until, retry_at, retry_remaining, last_success_watermark FROM jobs WHERE kind = ? AND job_key = ?`).get(JOB_STAGE1, thread.id) as any;
+      const job = this.db.prepare(`SELECT status, lease_until, retry_at, retry_remaining, input_watermark, last_success_watermark FROM jobs WHERE kind = ? AND job_key = ?`).get(JOB_STAGE1, thread.id) as any;
       const upToDate = (out && out.source_updated_at >= watermark) || (job && job.last_success_watermark != null && job.last_success_watermark >= watermark);
       if (upToDate) { this.db.exec("COMMIT"); return null; }
       if (job) {
-        if (job.retry_at != null && job.retry_at > t) { this.db.exec("COMMIT"); return null; }
+        const advanced = watermark > (job.input_watermark ?? -1);
+        if (!advanced && job.retry_at != null && job.retry_at > t) { this.db.exec("COMMIT"); return null; }
         if (job.status === "running" && job.lease_until != null && job.lease_until > t) { this.db.exec("COMMIT"); return null; }
-        if (job.retry_remaining <= 0 && job.status === "failed") { this.db.exec("COMMIT"); return null; }
-        this.db.prepare(`UPDATE jobs SET status='running', worker_id=?, ownership_token=?, started_at=?, finished_at=NULL, lease_until=?, retry_at=NULL, input_watermark=? WHERE kind=? AND job_key=?`)
-          .run(workerId, token, t, leaseUntil, watermark, JOB_STAGE1, thread.id);
+        if (!advanced && job.retry_remaining <= 0) { this.db.exec("COMMIT"); return null; }
+        this.db.prepare(`UPDATE jobs SET status='running', worker_id=?, ownership_token=?, started_at=?, finished_at=NULL, lease_until=?, retry_at=NULL, input_watermark=?, retry_remaining=?, last_error=NULL WHERE kind=? AND job_key=?`)
+          .run(workerId, token, t, leaseUntil, watermark, advanced ? DEFAULT_RETRY_REMAINING : job.retry_remaining, JOB_STAGE1, thread.id);
       } else {
         this.db.prepare(`INSERT INTO jobs (kind, job_key, status, worker_id, ownership_token, started_at, finished_at, lease_until, retry_at, retry_remaining, last_error, input_watermark, last_success_watermark)
           VALUES (?, ?, 'running', ?, ?, ?, NULL, ?, NULL, ?, NULL, ?, NULL)`).run(JOB_STAGE1, thread.id, workerId, token, t, leaseUntil, DEFAULT_RETRY_REMAINING, watermark);
@@ -170,7 +217,8 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       this.db.prepare(`INSERT INTO stage1_outputs (thread_id, source_updated_at, raw_memory, rollout_summary, rollout_slug, generated_at, usage_count, last_usage)
         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
         ON CONFLICT(thread_id) DO UPDATE SET source_updated_at=excluded.source_updated_at, raw_memory=excluded.raw_memory,
-          rollout_summary=excluded.rollout_summary, rollout_slug=excluded.rollout_slug, generated_at=excluded.generated_at`)
+          rollout_summary=excluded.rollout_summary, rollout_slug=excluded.rollout_slug, generated_at=excluded.generated_at
+        WHERE excluded.source_updated_at >= stage1_outputs.source_updated_at`)
         .run(threadId, sourceUpdatedAt, rawMemory, rolloutSummary, rolloutSlug, t);
       this.enqueueGlobalConsolidation(sourceUpdatedAt);
       this.db.exec("COMMIT");
@@ -194,8 +242,9 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   }
 
   markStage1JobFailed(threadId: string, token: string, reason: string, retryDelaySeconds: number): boolean {
+    reason = redact(reason);
     const t = now();
-    return this.db.prepare(`UPDATE jobs SET status='failed', finished_at=?, lease_until=NULL, retry_at=?, retry_remaining=MAX(retry_remaining - 1, 0), last_error=?
+    return this.db.prepare(`UPDATE jobs SET status='error', finished_at=?, lease_until=NULL, retry_at=?, retry_remaining=MAX(retry_remaining - 1, 0), last_error=?
       WHERE kind=? AND job_key=? AND status='running' AND ownership_token=?`).run(t, t + retryDelaySeconds, reason.slice(0, 500), JOB_STAGE1, threadId, token).changes > 0;
   }
 
@@ -231,9 +280,12 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     // Insert-or-bump input watermark; never touches a running lease.
     this.db.prepare(`INSERT INTO jobs (kind, job_key, status, retry_remaining, input_watermark, last_success_watermark)
       VALUES (?, ?, 'pending', ?, ?, 0)
-      ON CONFLICT(kind, job_key) DO UPDATE SET input_watermark = MAX(COALESCE(jobs.input_watermark, 0), excluded.input_watermark),
-        finished_at = CASE WHEN jobs.status = 'running' THEN jobs.finished_at ELSE NULL END,
-        last_error = CASE WHEN jobs.status = 'running' THEN jobs.last_error ELSE NULL END`)
+      ON CONFLICT(kind, job_key) DO UPDATE SET
+        status = CASE WHEN jobs.status = 'running' THEN 'running' ELSE 'pending' END,
+        retry_at = CASE WHEN jobs.status = 'running' THEN jobs.retry_at ELSE NULL END,
+        retry_remaining = MAX(jobs.retry_remaining, excluded.retry_remaining),
+        input_watermark = CASE WHEN excluded.input_watermark > COALESCE(jobs.input_watermark, 0)
+          THEN excluded.input_watermark ELSE COALESCE(jobs.input_watermark, 0) + 1 END`)
       .run(JOB_PHASE2, PHASE2_KEY, DEFAULT_RETRY_REMAINING, watermark);
   }
 
@@ -242,7 +294,7 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     const cutoff = now() - Math.max(0, maxUnusedDays) * 86400;
     const rows = this.db.prepare(`
       SELECT so.*, th.cwd, th.rollout_path, th.git_branch FROM stage1_outputs so
-      JOIN threads th ON th.id = so.thread_id AND th.memory_mode = 'enabled'
+      JOIN threads th ON th.id = so.thread_id AND th.memory_mode = 'enabled' AND th.source = 'interactive'
       WHERE (length(trim(so.raw_memory)) > 0 OR length(trim(so.rollout_summary)) > 0)
         AND ((so.last_usage IS NOT NULL AND so.last_usage >= ?) OR (so.last_usage IS NULL AND so.source_updated_at >= ?))
       ORDER BY COALESCE(so.usage_count, 0) DESC, COALESCE(so.last_usage, so.source_updated_at) DESC, so.source_updated_at DESC, so.thread_id DESC
@@ -289,6 +341,7 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       this.db.prepare(`UPDATE stage1_outputs SET selected_for_phase2=0, selected_for_phase2_source_updated_at=NULL WHERE selected_for_phase2 != 0 OR selected_for_phase2_source_updated_at IS NOT NULL`).run();
       const st = this.db.prepare(`UPDATE stage1_outputs SET selected_for_phase2=1, selected_for_phase2_source_updated_at=? WHERE thread_id=? AND source_updated_at=?`);
       for (const o of selected) st.run(o.sourceUpdatedAt, o.threadId, o.sourceUpdatedAt);
+      this.db.prepare(`UPDATE consolidation_progress SET max_thread_count=MAX(max_thread_count, ?)`).run(selected.length);
       this.db.exec("COMMIT");
       return true;
     } catch (e) { this.db.exec("ROLLBACK"); throw e; }
@@ -301,27 +354,40 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   }
 
   markGlobalPhase2JobFailed(token: string, reason: string, retryDelaySeconds: number): boolean {
+    reason = redact(reason);
     const t = now();
-    const ch = this.db.prepare(`UPDATE jobs SET status='failed', finished_at=?, lease_until=NULL, retry_at=?, retry_remaining=MAX(retry_remaining - 1, 0), last_error=?
+    const ch = this.db.prepare(`UPDATE jobs SET status='error', finished_at=?, lease_until=NULL, retry_at=?, retry_remaining=MAX(retry_remaining - 1, 0), last_error=?
       WHERE kind=? AND job_key=? AND status='running' AND ownership_token=?`).run(t, t + retryDelaySeconds, reason.slice(0, 500), JOB_PHASE2, PHASE2_KEY, token).changes;
     if (ch) return true;
-    // failed_if_unowned: lease expired and nobody else claimed
-    return this.db.prepare(`UPDATE jobs SET status='failed', finished_at=?, lease_until=NULL, retry_at=?, last_error=?
-      WHERE kind=? AND job_key=? AND (status != 'running' OR lease_until IS NULL OR lease_until <= ?)`).run(t, t + retryDelaySeconds, reason.slice(0, 500), JOB_PHASE2, PHASE2_KEY, t).changes > 0;
+    // Codex failed_if_unowned: never overwrite another owner's row or a terminal state.
+    return this.db.prepare(`UPDATE jobs SET status='error', finished_at=?, lease_until=NULL, retry_at=?, retry_remaining=MAX(retry_remaining - 1, 0), last_error=?
+      WHERE kind=? AND job_key=? AND status='running' AND (ownership_token=? OR ownership_token IS NULL)`).run(t, t + retryDelaySeconds, reason.slice(0, 500), JOB_PHASE2, PHASE2_KEY, token).changes > 0;
   }
 
   phase2Status() {
     return this.db.prepare(`SELECT status, started_at, finished_at, lease_until, retry_at, last_error, input_watermark, last_success_watermark FROM jobs WHERE kind=? AND job_key=?`).get(JOB_PHASE2, PHASE2_KEY) as any;
   }
   stage1Count(): number { return (this.db.prepare(`SELECT COUNT(*) AS n FROM stage1_outputs`).get() as any).n; }
+  maxConsolidatedThreadCount(): number { return (this.db.prepare(`SELECT max_thread_count FROM consolidation_progress WHERE singleton=1`).get() as any).max_thread_count; }
 
   // ---------- settings ----------
   getSetting(key: string): string | undefined { return (this.db.prepare(`SELECT value FROM settings WHERE key=?`).get(key) as any)?.value; }
   setSetting(key: string, value: string) { this.db.prepare(`INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(key, value); }
 
-  clearAll() {
+  /** Serialize synchronous filesystem mutations with reset and all job claims. No async callbacks. */
+  withMutation<T>(mutate: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");
-    try { this.db.exec("DELETE FROM stage1_outputs; DELETE FROM jobs; DELETE FROM threads;"); this.db.exec("COMMIT"); }
+    try { const result = mutate(); this.db.exec("COMMIT"); return result; }
     catch (e) { this.db.exec("ROLLBACK"); throw e; }
+  }
+
+  clearAll(clearFiles: () => void = () => {}) {
+    this.withMutation(() => {
+      // Fail closed even on expired leases: a detached writer may still be alive.
+      const active = this.db.prepare(`SELECT COUNT(*) AS n FROM jobs WHERE status='running'`).get() as any;
+      if (active.n) throw new Error("reset refused: memory jobs are still running; finish or recover them first");
+      clearFiles();
+      this.db.exec("DELETE FROM stage1_outputs; DELETE FROM jobs; DELETE FROM threads; UPDATE consolidation_progress SET max_thread_count=0;");
+    });
   }
 }

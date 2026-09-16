@@ -11,14 +11,17 @@ const MAX_GREP_HITS = 200;
 
 export class RootJail {
   readonly root: string;
-  constructor(root: string) { this.root = fs.realpathSync(root); }
+  constructor(root: string) {
+    if (fs.lstatSync(root).isSymbolicLink()) throw new Error("memory root must not be a symlink");
+    this.root = fs.realpathSync(root);
+  }
   resolve(rel: string, { mustExist = true } = {}): string {
     if (typeof rel !== "string" || !rel.trim()) throw new Error("path required");
-    if (path.isAbsolute(rel) || /^[A-Za-z]:/.test(rel)) throw new Error("absolute paths are not allowed; use paths relative to the memory root");
+    if (path.isAbsolute(rel) || rel.includes(":")) throw new Error("absolute paths are not allowed; use paths relative to the memory root");
     const target = path.resolve(this.root, rel);
     const relative = path.relative(this.root, target);
     if (relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) throw new Error("path escapes memory root");
-    if (relative.split(path.sep)[0] === ".git") throw new Error(".git is not accessible");
+    if (relative.split(path.sep)[0].toLowerCase() === ".git") throw new Error(".git is not accessible");
     // No symlink/junction anywhere along the existing prefix.
     let cur = this.root;
     for (const seg of relative.split(path.sep).filter(Boolean)) {
@@ -38,7 +41,7 @@ function listDir(jail: RootJail, dirRel: string, recursive: boolean): string[] {
   while (stack.length) {
     const d = stack.pop()!;
     for (const e of fs.readdirSync(d, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
-      if (e.name === ".git" || e.isSymbolicLink()) continue;
+      if (e.name.toLowerCase() === ".git" || e.isSymbolicLink()) continue;
       const p = path.join(d, e.name);
       if (e.isDirectory()) { out.push(jail.rel(p) + "/"); if (recursive) stack.push(p); }
       else if (e.isFile()) out.push(`${jail.rel(p)} (${fs.statSync(p).size} bytes)`);
@@ -49,14 +52,14 @@ function listDir(jail: RootJail, dirRel: string, recursive: boolean): string[] {
 
 export function consolidationTools(jail: RootJail) {
   const text = (t: string) => ({ content: [{ type: "text" as const, text: t }] });
-  const tools: { def: { name: string; description: string; parameters: any }; run: (a: any) => Promise<{ content: { type: "text"; text: string }[] }> }[] = [
+  const tools: { def: { name: string; description: string; parameters: any }; run: (a: any) => { content: { type: "text"; text: string }[] } }[] = [
     {
       def: { name: "list", description: "List files under a directory of the memory root (relative path, '.' for root).", parameters: Type.Object({ path: Type.Optional(Type.String()), recursive: Type.Optional(Type.Boolean()) }) },
-      run: async a => text(listDir(jail, a.path ?? ".", a.recursive ?? false).join("\n") || "(empty)"),
+      run: a => text(listDir(jail, a.path ?? ".", a.recursive ?? false).join("\n") || "(empty)"),
     },
     {
       def: { name: "read", description: "Read a UTF-8 text file inside the memory root. Optional 1-based line range.", parameters: Type.Object({ path: Type.String(), start: Type.Optional(Type.Integer({ minimum: 1 })), end: Type.Optional(Type.Integer({ minimum: 1 })) }) },
-      run: async a => {
+      run: a => {
         const p = jail.resolve(a.path);
         if (!fs.statSync(p).isFile()) throw new Error("not a file");
         const buf = fs.readFileSync(p);
@@ -68,7 +71,7 @@ export function consolidationTools(jail: RootJail) {
     },
     {
       def: { name: "grep", description: "Case-insensitive substring/regex search across files under the memory root. Returns path:line: text.", parameters: Type.Object({ pattern: Type.String(), path: Type.Optional(Type.String()), regex: Type.Optional(Type.Boolean()) }) },
-      run: async a => {
+      run: a => {
         const re = a.regex ? new RegExp(a.pattern, "i") : null; const q = String(a.pattern).toLowerCase();
         const hits: string[] = [];
         const start = jail.resolve(a.path ?? ".");
@@ -83,11 +86,11 @@ export function consolidationTools(jail: RootJail) {
     },
     {
       def: { name: "write", description: "Create or overwrite a text file inside the memory root (parent directories are created).", parameters: Type.Object({ path: Type.String(), content: Type.String() }) },
-      run: async a => { const p = jail.resolve(a.path, { mustExist: false }); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, a.content); return text(`wrote ${jail.rel(p)} (${Buffer.byteLength(a.content)} bytes)`); },
+      run: a => { const p = jail.resolve(a.path, { mustExist: false }); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, a.content); return text(`wrote ${jail.rel(p)} (${Buffer.byteLength(a.content)} bytes)`); },
     },
     {
       def: { name: "edit", description: "Replace an exact, unique text block in a file inside the memory root.", parameters: Type.Object({ path: Type.String(), old: Type.String(), new: Type.String() }) },
-      run: async a => {
+      run: a => {
         const p = jail.resolve(a.path); const s = fs.readFileSync(p, "utf8");
         const i = s.indexOf(a.old); if (i < 0) throw new Error("old text not found"); if (s.indexOf(a.old, i + 1) >= 0) throw new Error("old text is not unique");
         fs.writeFileSync(p, s.slice(0, i) + a.new + s.slice(i + a.old.length)); return text(`edited ${jail.rel(p)}`);
@@ -95,7 +98,7 @@ export function consolidationTools(jail: RootJail) {
     },
     {
       def: { name: "delete", description: "Delete a file (or empty directory) inside the memory root. Never deletes ad-hoc notes or the workspace diff.", parameters: Type.Object({ path: Type.String() }) },
-      run: async a => {
+      run: a => {
         const p = jail.resolve(a.path); const rel = jail.rel(p);
         if (rel.startsWith("extensions/ad_hoc/notes/") || rel === "phase2_workspace_diff.md") throw new Error("this file must not be deleted");
         const st = fs.lstatSync(p); if (st.isDirectory()) fs.rmdirSync(p); else fs.unlinkSync(p); return text(`deleted ${rel}`);
@@ -103,12 +106,9 @@ export function consolidationTools(jail: RootJail) {
     },
     {
       def: { name: "mkdir", description: "Create a directory inside the memory root.", parameters: Type.Object({ path: Type.String() }) },
-      run: async a => { const p = jail.resolve(a.path, { mustExist: false }); fs.mkdirSync(p, { recursive: true }); return text(`created ${jail.rel(p)}/`); },
+      run: a => { const p = jail.resolve(a.path, { mustExist: false }); fs.mkdirSync(p, { recursive: true }); return text(`created ${jail.rel(p)}/`); },
     },
-    {
-      def: { name: "done", description: "Call exactly once when consolidation is complete and MEMORY.md + memory_summary.md are final.", parameters: Type.Object({ summary: Type.String({ description: "One paragraph: what changed" }) }) },
-      run: async a => text(`done: ${a.summary}`),
-    },
+
   ];
   return tools;
 }

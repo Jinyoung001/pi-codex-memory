@@ -2,6 +2,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { atomicWrite } from "../safety.js";
+import { RootJail } from "./agent-tools.ts";
 import { EXTENSION_RESOURCES } from "./config.ts";
 import type { Stage1Output } from "./store.ts";
 
@@ -51,10 +52,12 @@ export function pruneOldExtensionResources(root: string, nowMs = Date.now()) {
     const res = path.join(ext, e.name, "resources");
     if (!fs.existsSync(res)) continue;
     for (const f of fs.readdirSync(res)) {
+      if (!f.endsWith(".md") || !fs.lstatSync(path.join(res, f)).isFile()) continue;
       const m = f.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})/);
       if (!m) continue;
       const ts = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
-      if (ts < cutoff) fs.rmSync(path.join(res, f), { force: true });
+      if (new Date(ts).toISOString().slice(0, 19).replace(/:/g, "-") !== f.slice(0, 19)) continue;
+      if (ts <= cutoff) fs.rmSync(path.join(res, f), { force: true });
     }
   }
 }
@@ -123,14 +126,31 @@ export function rebuildRawMemoriesFile(root: string, memories: Stage1Output[]) {
   if (!fs.existsSync(p) || fs.readFileSync(p, "utf8") !== body) atomicWrite(p, body);
 }
 
-/** workspace.rs validate_consolidation_artifacts (V1). */
-export function validateConsolidationArtifacts(root: string) {
+// Pinned workspace.rs::is_valid_v2_summary, also used by local readiness status.
+export function isValidV2Summary(content: string): boolean {
+  const lines = content.split(/\r?\n/);
+  return lines[0] === "v1" && Buffer.byteLength(content) < 10000
+    && ["## User Profile", "## User preferences", "## General Tips", "## What's in Memory"].every(h => lines.some(line => line.trim() === h));
+}
+
+/** Local equivalent of app-server memory/status. No server or automatic version switch. */
+export function memoryReadiness(root: string, consolidatedThreads: number, minimum = 20) {
+  if (!Number.isSafeInteger(minimum) || minimum < 1 || minimum > 4096) throw new Error("minConsolidatedThreads must be between 1 and 4096");
+  let valid = false;
+  try { valid = isValidV2Summary(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(fs.readFileSync(new RootJail(root).resolve("memory_summary.md")))); } catch { /* Missing or unsafe summary is not ready. */ }
+  return { v2_consolidated_threads: consolidatedThreads, v2_ready: consolidatedThreads >= minimum && valid };
+}
+
+/** workspace.rs validate_consolidation_artifacts. */
+export function validateConsolidationArtifacts(root: string, version: "v1" | "v2" = "v1") {
   const removed = removeMemorySymlinks(root);
   if (removed) throw new Error(`removed ${removed} symbolic links from consolidated memory workspace`);
   const mem = path.join(root, "MEMORY.md");
-  if (!fs.existsSync(mem) || !fs.statSync(mem).isFile()) throw new Error(`consolidated memory artifact missing: ${mem}`);
+  if (version === "v1" && (!fs.existsSync(mem) || !fs.statSync(mem).isFile())) throw new Error(`consolidated memory artifact missing: ${mem}`);
   const sum = path.join(root, "memory_summary.md");
   if (!fs.existsSync(sum)) throw new Error(`memory summary artifact missing: ${sum}`);
-  const first = fs.readFileSync(sum, "utf8").split(/\r?\n/, 1)[0];
+  const content = fs.readFileSync(sum, "utf8");
+  if (version === "v2" && !isValidV2Summary(content)) throw new Error("invalid V2 summary");
+  const first = content.split(/\r?\n/, 1)[0];
   if (first !== "v1") throw new Error(`memory summary artifact does not start with v1: ${sum}`);
 }

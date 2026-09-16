@@ -1,9 +1,111 @@
 {
   "repository": "https://github.com/openai/codex",
-  "commit": "4e6450bbfd60bdfa845182f30aaa9d6f068e8bbd",
-  "commitDate": "2026-09-15T00:42:31Z",
+  "commit": "5bf132cd527311eb61bbec46562e3890eb49df80",
+  "commitDate": "2026-09-16T01:16:35Z",
   "normalization": "UTF-8, CRLF converted to LF before hashing",
+  "auditedSources": {
+    "ext_lib.rs": {
+      "path": "codex-rs/ext/memories/src/lib.rs",
+      "sha256": "a6c7915326ad8420a70ec838d7cd40184967505734e2179923deb13b43c5b653"
+    },
+    "memory_readiness.rs": {
+      "path": "codex-rs/state/src/runtime/memory_readiness.rs",
+      "sha256": "5b917dc78f9f3a47ebbb2fa928fec28314297eb7376618c83f7b3a97b58b3227"
+    },
+    "memory_status.rs": {
+      "path": "codex-rs/app-server/src/request_processors/memory_status.rs",
+      "sha256": "2a4fadad26f731128a42bf071f854056c6da9bd894e877c056a23dd9f1393f24"
+    },
+    "write_lib.rs": {
+      "path": "codex-rs/memories/write/src/lib.rs",
+      "sha256": "e4d3a9f5bfc15c626560451b126419c8b7acee2556d79e8216c19b98004c98f2"
+    },
+    "phase1.rs": {
+      "path": "codex-rs/memories/write/src/phase1.rs",
+      "sha256": "5fd4cc0522b0dbc641fab5f3105a6f4d1e6a8c60eb6e48e69781b70689adbba7"
+    },
+    "phase2.rs": {
+      "path": "codex-rs/memories/write/src/phase2.rs",
+      "sha256": "12bf902267880c584d1123f66f4139df90d1ded26c19d629244e9ea545f5be5b"
+    },
+    "start.rs": {
+      "path": "codex-rs/memories/write/src/start.rs",
+      "sha256": "5a95832c2e8e8e327377d62f94705bafd1102a2aa452552276ae2cfd24da9330"
+    },
+    "runtime.rs": {
+      "path": "codex-rs/memories/write/src/runtime.rs",
+      "sha256": "3878b2fe3a8a5cf99c59db27212528b6b723b7fd846400718474f14dc3ca118c"
+    },
+    "rollout_input.rs": {
+      "path": "codex-rs/memories/write/src/rollout_input.rs",
+      "sha256": "f611749c4c924502110340adb0a7a97025ded073500c708958a5ca831e9f332e"
+    },
+    "phase1_output.rs": {
+      "path": "codex-rs/memories/write/src/phase1_output.rs",
+      "sha256": "d9ee40a1367722dcdf6b4b743e2491fb9c921e68e86e54bde28b6fceb31cb7ee"
+    },
+    "storage.rs": {
+      "path": "codex-rs/memories/write/src/storage.rs",
+      "sha256": "8409711b3361dcb4dd9f3a80f2c4d76e7242452c09e5ec494c1c4865e536ac3f"
+    },
+    "workspace.rs": {
+      "path": "codex-rs/memories/write/src/workspace.rs",
+      "sha256": "b48afd2fa3f72c8f3c344e1280feba8e17cec31d6f7750af868490e2aef7ffb3"
+    },
+    "write_prompts.rs": {
+      "path": "codex-rs/memories/write/src/prompts.rs",
+      "sha256": "ae71fbd98fa0fe7bc0cf678ef908bfbdba915c21181c3a6cd3181a7efb98b9f1"
+    },
+    "guard.rs": {
+      "path": "codex-rs/memories/write/src/guard.rs",
+      "sha256": "bff35c87f3187d105a90dc279cd09dd7f4f976e8a4bb18c5283ea0a479df9d40"
+    },
+    "control.rs": {
+      "path": "codex-rs/memories/write/src/control.rs",
+      "sha256": "17aecfe05403edc8084bd7a433bdec91c5ed21f43044c6b5d8a3ee873649912c"
+    },
+    "config_types.rs": {
+      "path": "codex-rs/config/src/types.rs",
+      "sha256": "ae4ffb3a668e8962ea6cc697fa1b31a983a04d232ce5b22357a54b66c61c7656"
+    },
+    "state_memories.rs": {
+      "path": "codex-rs/state/src/runtime/memories.rs",
+      "sha256": "823ebdc61ac448cad68fbf3ce337eebaa8f08fb1c361ea2c9ffa8d2220ae9f1b"
+    },
+    "rollout_input_tests.rs": {
+      "path": "codex-rs/memories/write/src/rollout_input_tests.rs",
+      "sha256": "59622a00fb279c28c7686abb6e4b7995ddfe07448296e90a0c5e8c53a06b5487"
+    },
+    "output_truncation.rs": {
+      "path": "codex-rs/utils/output-truncation/src/lib.rs",
+      "sha256": "e2e23cc1b3c9153bef0855cb3c7c91c68e6e43117647c3e97feefda92026a38e"
+    },
+    "string_lib.rs": {
+      "path": "codex-rs/utils/string/src/lib.rs",
+      "sha256": "8cce3b8b9e583b9ea7f8d49acff074707d517f6b9cbf294aefd135df5d02017c"
+    },
+    "string_truncate.rs": {
+      "path": "codex-rs/utils/string/src/truncate.rs",
+      "sha256": "d5755286344f10d10b4bd9f93bb3bff6f1b85270a15df378254051b147ad38ad"
+    },
+    "string_truncate_tests.rs": {
+      "path": "codex-rs/utils/string/src/truncate/tests.rs",
+      "sha256": "c2b000b02eaa736362eb01f7dac0e981db4c8d081ed15710bda33bf3b437e1e0"
+    },
+    "citations_tests.rs": {
+      "path": "codex-rs/memories/read/src/citations_tests.rs",
+      "sha256": "99bff775ed93feffb9a4d59e13b4329619bd6fe420ca29b5d72208d0a01f31a2"
+    },
+    "ext_tests.rs": {
+      "path": "codex-rs/ext/memories/src/tests.rs",
+      "sha256": "a8d473cb31a04c43d412c3bdf7f96ffb23bc69010c8ae95f77d754f78b05c8f7"
+    }
+  },
   "promptsSha256": {
+    "stage_one_system_v2.md": "334c0d51a2c63bd317dac074155fb3ecf0a56af8b00657736bab9c74222372b4",
+    "stage_one_input_v2.md": "8fd4bb25fe6bd746b2d46ad841ac3a195d220c3da0cb9230615e2347c6ef853e",
+    "consolidation_v2.md": "7334fdb4aa5d958bcff54568a375d0b0145c19a611a1a22faa6bf251a46a5f0e",
+    "read_path_v2.md": "2f81fa2e89f341a1b7b3cf11ee7b855087c4ab84ddad920980475465ef28ff27",
     "stage_one_system.md": "cf795e8a2f5f52d333af2613bf1ff79178112f5fd2161cc181a8ddf52e59da33",
     "stage_one_input.md": "2e54c74909238022305c269c862910bb29509fda8b58ce671ef011f8d6453047",
     "consolidation.md": "1450e24f84c03375aa5114c6c0857f515395129dcc00f65263221d03866852a0",
@@ -11,6 +113,10 @@
     "extensions/ad_hoc/instructions.md": "d36a36083d92f9d44efbd95e0e4b6e81d7d149e812f2bca2009b6dd4b8aa93e7"
   },
   "sourcePaths": {
+    "stage_one_system_v2.md": "codex-rs/memories/write/templates/memories/stage_one_system_v2.md",
+    "stage_one_input_v2.md": "codex-rs/memories/write/templates/memories/stage_one_input_v2.md",
+    "consolidation_v2.md": "codex-rs/memories/write/templates/memories/consolidation_v2.md",
+    "read_path_v2.md": "codex-rs/ext/memories/templates/memories/read_path_v2.md",
     "read_path.md": "codex-rs/ext/memories/templates/memories/read_path.md",
     "extensions/ad_hoc/instructions.md": "codex-rs/memories/write/templates/extensions/ad_hoc/instructions.md",
     "stage_one_system.md": "codex-rs/memories/write/templates/memories/stage_one_system.md",

@@ -2,7 +2,25 @@
 
 A standalone pi extension porting the memory behavior of [OpenAI Codex](https://github.com/openai/codex/tree/5bf132cd527311eb61bbec46562e3890eb49df80/codex-rs/memories), pinned to commit `5bf132cd527311eb61bbec46562e3890eb49df80`. Uses pi sessions, model registry and authentication; no Codex installation or account is required. Host differences and verification: [CODEX_PARITY.md](CODEX_PARITY.md).
 
-Requires Node >=22.13, pi >=0.85.1 and Git. Install this checkout with `pi install C:/myprojects/pi-codex-memory`, then reload pi. No runtime upstream updates.
+## Installation
+
+Requires Node >=22.13, pi >=0.85.1 and Git.
+
+Install the published extension with pi:
+
+```sh
+pi install npm:pi-codex-memory
+```
+
+Restart pi or run `/reload` in an existing session, then use `/memories status` to check the extension. The current pi session model is used by default; no separate model configuration is required.
+
+Update an existing npm installation:
+
+```sh
+pi update npm:pi-codex-memory
+```
+
+Reload pi after updating. For local development, install a checkout with `pi install /path/to/pi-codex-memory`. The pinned Codex upstream source is not updated automatically at runtime.
 
 ## Behavior
 

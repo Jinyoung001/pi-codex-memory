@@ -26,7 +26,7 @@ export function registryRuntime(llm: Llm, model: MemoryModel, request: (model: M
 }
 
 export type SessionUsage = { requests: number; input: number; output: number; cacheRead: number; totalTokens: number };
-export async function runPiConsolidationSession(llm: Llm, model: MemoryModel, cfg: MemoriesConfig, root: string, systemPrompt: string, prompt: string, signal: AbortSignal, guarded: <T>(fn:()=>T)=>T, onProgress?: (s:string)=>void) {
+export async function runPiConsolidationSession(llm: Llm, model: MemoryModel, cfg: MemoriesConfig, root: string, systemPrompt: string, prompt: string, signal: AbortSignal, guarded: <T>(fn:()=>T)=>T, onProgress?: (s:string)=>void, onUsage?: (u: SessionUsage)=>void) {
   const progress = (message: string) => { try { onProgress?.(message); } catch { /* Observers must not change tool outcomes. */ } };
   const {createAgentSession,DefaultResourceLoader,SessionManager,SettingsManager}=await import("@earendil-works/pi-coding-agent");
   const settingsManager=SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:false},packages:[],extensions:[],skills:[],prompts:[],enableAnalytics:false,enableInstallTelemetry:false});
@@ -65,13 +65,13 @@ export async function runPiConsolidationSession(llm: Llm, model: MemoryModel, cf
     if(compactionFailure)throw new Error(compactionFailure);
     const last=[...session.messages].reverse().find(m=>m.role==="assistant");
     if(last?.stopReason!=="stop")throw new Error(last?.errorMessage??"consolidation did not complete");
-    return {completed:true, usage};
+    return {completed:true};
   } finally {
     unsubscribe();signal.removeEventListener("abort",abort);
     try { await session.abort(); } catch (e) { abortError = e; }
     finally { session.dispose(); }
     if (abortError) progress('session abort cleanup failed');
     // Report on every exit path: runaway or failing consolidations are exactly where cost matters.
-    if (usage.requests) progress(`usage requests=${usage.requests} input=${usage.input} cacheRead=${usage.cacheRead} output=${usage.output} total=${usage.totalTokens}`);
+    if (usage.requests) { try { onUsage?.(usage); } catch { /* observers must not change outcomes */ } }
   }
 }

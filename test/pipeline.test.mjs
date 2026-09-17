@@ -190,7 +190,7 @@ test('tool result compaction caps, folds repeats, dedups identical results and s
   assert.doesNotMatch(raw.text, /truncated|identical to|same line/);
   assert.match(small.text, /\[human user\]\nkeep u{6000}/);
   assert.match(small.text, /\[tool read #1\]\nline 0 .*…\d+ tokens truncated…/s);
-  assert.match(small.text, /\[tool read #2\]\n\[identical to tool result #1\]/);
+  assert.match(small.text, /\[tool read #2\]\n\[identical to tool result #1: line 0 /);
   assert.match(small.text, /warning: same\n\[… same line ×50\]/);
   const err = small.text.split('[tool bash #4 (error)]\n')[1];
   assert.ok(err.length > 500 * 4 && err.length <= 500 * ERROR_BUDGET_MULTIPLIER * 4 + 64, 'error results keep a larger budget');
@@ -208,8 +208,11 @@ test('human replies to request_user_input are never compacted', t => {
   ];
   fs.writeFileSync(f, lines.map(l => JSON.stringify(l)).join('\n') + '\n');
   const r = renderSession(f, 100);
-  assert.ok(r.rows.some(row => row.startsWith('[human user]\nAssistant question:') && row.endsWith('Human reply: ' + reply)));
-  assert.doesNotMatch(r.rows.find(row => row.startsWith('[human user]')), /truncated|identical/);
+  const humanRow = r.rows.find(row => row.startsWith('[human user]'));
+  assert.ok(humanRow, 'human user row present');
+  assert.ok(humanRow.startsWith('[human user]\nAssistant question:'), 'human row starts with the assistant question');
+  assert.ok(humanRow.endsWith('Human reply: ' + reply), 'human reply rendered verbatim');
+  assert.doesNotMatch(humanRow, /truncated|identical/);
 });
 
 // ---- end-to-end with a fake model (no network) ----

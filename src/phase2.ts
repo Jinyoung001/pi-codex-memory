@@ -138,8 +138,8 @@ export async function run(store: MemoryStore, cfg: MemoriesConfig, llm: Llm, roo
   } catch (e) { return fail(e instanceof Error ? e.message : String(e)); }
 }
 
-async function runConsolidationAgent(llm: Llm, model: MemoryModel, cfg: MemoriesConfig, root: string, log: Log, signal: AbortSignal, onProgress: ((s: string) => void) | undefined, guarded: <T>(fn: () => T) => T): Promise<{ completed: boolean; error?: string; usage?: SessionUsage }> {
-  // The session reports `usage …` on every exit path (success, failure, abort); persist it to the log.
-  const progress = (s: string) => { if (s.startsWith('usage ')) log(`phase2: ${s}`); onProgress?.(s); };
-  return runPiConsolidationSession(llm,model,cfg,root,buildConsolidationPrompt(root,cfg.version)+HARNESS_NOTE(root),`Begin. Read ${WORKSPACE_DIFF.FILENAME} first.`,signal,guarded,progress);
+async function runConsolidationAgent(llm: Llm, model: MemoryModel, cfg: MemoriesConfig, root: string, log: Log, signal: AbortSignal, onProgress: ((s: string) => void) | undefined, guarded: <T>(fn: () => T) => T): Promise<{ completed: boolean; error?: string }> {
+  // Reported on every exit path (success, failure, abort): runaway consolidations are where cost matters.
+  const onUsage = (u: SessionUsage) => log(`phase2: usage requests=${u.requests} input=${u.input} cacheRead=${u.cacheRead} output=${u.output} total=${u.totalTokens}`);
+  return runPiConsolidationSession(llm,model,cfg,root,buildConsolidationPrompt(root,cfg.version)+HARNESS_NOTE(root),`Begin. Read ${WORKSPACE_DIFF.FILENAME} first.`,signal,guarded,onProgress,onUsage);
 }

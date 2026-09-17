@@ -64,7 +64,7 @@ Saved in `~/.pi/agent/memories.json`:
 Stage 1 re-reads whole rollouts, and on real sessions roughly 70% of a rollout is tool output (file reads, command stdout). Two levers, both dependency-free:
 
 1. **Cheaper model** — `extract_model` / `consolidation_model` (above). This is by far the largest saving.
-2. **`tool_result_token_budget`** (host addition, not in Codex; default `1000`, `0` disables) — before extraction each tool result is capped to this many tokens with head+tail retained (errors keep 3x), runs of identical lines are folded to `[… same line ×N]`, and a repeated identical result becomes `[identical to tool result #N]`. User and assistant text is never altered, so the extractor sees the whole conversation instead of losing its tail to one large file dump.
+2. **`tool_result_token_budget`** (host addition, not in Codex; default `1000`, `0` disables) — before extraction each tool result is capped to this many tokens with head+tail retained (errors keep 3x), runs of identical lines are folded to `[… same line ×N]`, and a repeated identical result becomes `[identical to tool result #N: <first line>]` (tool rows are numbered `[tool name #N]`). User and assistant text is never altered, so the extractor sees the whole conversation instead of losing its tail to one large file dump.
 
 Measure on your own sessions without any model calls:
 

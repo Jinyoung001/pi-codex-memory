@@ -7,22 +7,31 @@ import { listSessionFiles, renderSession, rolloutTokenLimit } from '../src/rollo
 import { truncateTokens } from '../src/codex-truncate.ts';
 
 const budget = Number(process.argv[2] ?? 1000), max = Number(process.argv[3] ?? 40), cap = rolloutTokenLimit(undefined);
-if (!Number.isSafeInteger(budget) || budget < 0 || !Number.isSafeInteger(max) || max < 1) { console.error('usage: bench-compaction.mjs [budget>=0] [maxSessions>=1]'); process.exit(2); }
-const PRICES = process.env.BENCH_PRICES ? JSON.parse(process.env.BENCH_PRICES) : {
+const die = m => { console.error(m); process.exit(2); };
+if (!Number.isSafeInteger(budget) || budget < 0 || !Number.isSafeInteger(max) || max < 1) die('usage: bench-compaction.mjs [budget>=0] [maxSessions>=1]');
+const DEFAULT_PRICES = {
   'session model (gpt-6-astra / claude-fable-5.1)': { in: 10, out: 50 },
   'deepseek-v4.1-flash': { in: 0.30, out: 1.20 },
 };
+let PRICES;
+try { PRICES = process.env.BENCH_PRICES ? JSON.parse(process.env.BENCH_PRICES) : DEFAULT_PRICES; } catch (e) { die(`BENCH_PRICES is not valid JSON: ${e.message}`); }
+if (PRICES === null || typeof PRICES !== 'object' || Array.isArray(PRICES) || !Object.keys(PRICES).length) die('BENCH_PRICES must be a non-empty JSON object of { name: { in, out } }');
+for (const [name, p] of Object.entries(PRICES)) {
+  if (/^\d+$/.test(name)) die(`BENCH_PRICES key "${name}" must not be an integer (JS reorders integer-like keys, breaking the first-entry baseline)`);
+  if (!(Number.isFinite(p?.in) && p.in > 0 && Number.isFinite(p?.out) && p.out > 0)) die(`BENCH_PRICES[${name}] must have positive numeric in/out`);
+}
+const MIN_SESSION_TOKENS = 1000; // skip trivial sessions
 const P1_OUT_TOKENS = 1500; // typical stage-1 JSON (raw_memory + rollout_summary); thinking adds on top, ignored here
 const tok = s => Math.ceil(Buffer.byteLength(s) / 4);
 const rows = [];
 for (const { file } of listSessionFiles().sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, max)) {
-  let raw, small;
+  let raw, small; // renders twice (raw + compacted); doubles I/O when maxSessions is large
   try { raw = renderSession(file).text; small = renderSession(file, budget).text; } catch (e) { console.error(`skip ${file}: ${e.message}`); continue; }
   const r = tok(raw), s = tok(small);
-  if (r < 1000) continue;
+  if (r < MIN_SESSION_TOKENS) continue;
   rows.push({ raw: r, small: s, sentRaw: tok(truncateTokens(raw, cap)), sentSmall: tok(truncateTokens(small, cap)) });
 }
-if (!rows.length || !Object.keys(PRICES).length) { console.error('no sessions >= 1000 tokens found, or BENCH_PRICES is empty'); process.exit(1); }
+if (!rows.length) { console.error(`no sessions >= ${MIN_SESSION_TOKENS} tokens found`); process.exit(1); }
 const sum = k => rows.reduce((a, x) => a + x[k], 0), pct = (a, b) => `${(100 * (1 - a / b)).toFixed(1)}%`;
 console.log(`sessions=${rows.length} budget=${budget} cap=${cap}`);
 console.log(`rendered:   ${sum('raw')} -> ${sum('small')} tok  (-${pct(sum('small'), sum('raw'))})`);
@@ -32,7 +41,9 @@ console.log(`median per-session reduction: ${pct(med(rows.map(x => x.small / x.r
 
 console.log(`\nstage-1 cost for these ${rows.length} sessions (input tokens actually sent + ${P1_OUT_TOKENS} output tokens each):`);
 const cost = (p, inTok) => (inTok * p.in + rows.length * P1_OUT_TOKENS * p.out) / 1e6;
-const base = cost(Object.values(PRICES)[0], sum('sentRaw'));
+const [baseName, basePrice] = Object.entries(PRICES)[0]; // first entry = baseline
+const base = cost(basePrice, sum('sentRaw'));
+console.log(`  (baseline = ${baseName}, raw)`);
 for (const [name, p] of Object.entries(PRICES)) {
   const a = cost(p, sum('sentRaw')), b = cost(p, sum('sentSmall'));
   console.log(`  ${name.padEnd(48)} raw $${a.toFixed(4)}  compacted $${b.toFixed(4)}  (x${(base / b).toFixed(1)} cheaper than baseline raw)`);

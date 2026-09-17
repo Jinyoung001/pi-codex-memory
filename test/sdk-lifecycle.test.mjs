@@ -18,6 +18,17 @@ test('real SDK finishes after 65 tool turns without done or synthetic completion
   await runPiConsolidationSession(llm,model,DEFAULTS,root,'Consolidate.','Begin.',new AbortController().signal,fn=>{guards++;return fn();});
   assert.equal(calls,66);assert.equal(guards,131);assert.equal(fs.readFileSync(path.join(root,'memory_summary.md'),'utf8'),'turn 65');
 });
+test('onUsage reports accumulated tokens on success and on failure after requests',{timeout:60000},async t=>{
+  let calls=0;
+  const ok=setup(t,async()=>{calls++;return calls<3?reply([{type:'toolCall',id:`w${calls}`,name:'write',arguments:{path:'memory_summary.md',content:'x'}}],'toolUse'):reply([{type:'text',text:'Done.'}]);});
+  let usage;
+  await runPiConsolidationSession(ok.llm,model,DEFAULTS,ok.root,'Consolidate.','Begin.',new AbortController().signal,fn=>fn(),undefined,u=>{usage=u;});
+  assert.deepEqual(usage,{requests:3,input:30,output:15,cacheRead:0,totalTokens:45});
+  let failCalls=0,failUsage;
+  const bad=setup(t,async()=>{failCalls++;return failCalls<2?reply([{type:'toolCall',id:'w',name:'write',arguments:{path:'memory_summary.md',content:'x'}}],'toolUse'):reply([{type:'text',text:'partial'}],'error');});
+  await assert.rejects(runPiConsolidationSession(bad.llm,model,DEFAULTS,bad.root,'Consolidate.','Begin.',new AbortController().signal,fn=>fn(),undefined,u=>{failUsage=u;}),/consolidation did not complete/);
+  assert.equal(failUsage?.requests,2,'usage is still reported when the session fails');
+});
 test('real SDK propagates cancellation during provider request',{timeout:60000},async t=>{
   const ac=new AbortController();
   const {root,llm}=setup(t,async(_m,_c,o)=>{queueMicrotask(()=>ac.abort());await new Promise((_,reject)=>o.signal.addEventListener('abort',()=>reject(Error('aborted')),{once:true}));});

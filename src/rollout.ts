@@ -122,12 +122,23 @@ export function compactToolResult(text: string, budget: number, isError: boolean
   if (text.length > 200) {
     const key = createHash('sha256').update(text).digest('hex');
     const first = seen.get(key);
-    if (first !== undefined) return `[identical to tool result #${first}]`;
+    // Keep a first-line hint: the referenced row may itself be truncated away by the rollout budget.
+    if (first !== undefined) {
+      const firstLine = (text.split('\n').find(l => l.trim()) ?? '').trim();
+      const hint = firstLine.length > 80 ? `${firstLine.slice(0, 80)}…` : firstLine;
+      return `[identical to tool result #${first}: ${hint}]`;
+    }
     seen.set(key, index);
   }
   // Fold runs of identical non-blank lines (rtk-style dedup): progress bars, repeated warnings, log spam.
   const lines = text.split('\n'), folded: string[] = [];
-  for (let i = 0; i < lines.length; i++) { let n = 1; while (i + n < lines.length && lines[i + n] === lines[i]) n++; folded.push(n > 2 && lines[i].trim() ? `${lines[i]}\n[… same line ×${n}]` : lines.slice(i, i + n).join('\n')); i += n - 1; }
+  for (let i = 0; i < lines.length; i++) {
+    let n = 1;
+    while (i + n < lines.length && lines[i + n] === lines[i]) n++;
+    const foldable = n > 2 && lines[i].trim() !== '';
+    folded.push(foldable ? `${lines[i]}\n[… same line ×${n}]` : lines.slice(i, i + n).join('\n'));
+    i += n - 1;
+  }
   return truncateTokens(folded.join('\n'), isError ? budget * ERROR_BUDGET_MULTIPLIER : budget);
 }
 

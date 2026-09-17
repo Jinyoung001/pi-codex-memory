@@ -116,16 +116,19 @@ export function normalizeSession(file: string): {id:string;cwd:string;evidence:E
 // Host addition (not upstream): shrink tool results before stage-1 extraction. Tool output is ~70% of a
 // rollout and mostly file dumps/command noise; user and assistant text is never touched. Errors keep a
 // larger budget because failures are what memory is for. Deterministic, no external tools.
+export const ERROR_BUDGET_MULTIPLIER = 3;
 export function compactToolResult(text: string, budget: number, isError: boolean, seen: Map<string, number>, index: number): string {
-  if (budget <= 0) return text;
-  const key = createHash('sha256').update(text).digest('hex');
-  const first = seen.get(key);
-  if (first !== undefined && text.length > 200) return `[identical to tool result #${first}]`;
-  seen.set(key, index);
-  // Fold runs of identical lines (rtk-style dedup): progress bars, repeated warnings, log spam.
+  if (!(budget > 0)) return text;
+  if (text.length > 200) {
+    const key = createHash('sha256').update(text).digest('hex');
+    const first = seen.get(key);
+    if (first !== undefined) return `[identical to tool result #${first}]`;
+    seen.set(key, index);
+  }
+  // Fold runs of identical non-blank lines (rtk-style dedup): progress bars, repeated warnings, log spam.
   const lines = text.split('\n'), folded: string[] = [];
-  for (let i = 0; i < lines.length; i++) { let n = 1; while (i + n < lines.length && lines[i + n] === lines[i]) n++; folded.push(n > 2 ? `${lines[i]}\n[… same line ×${n}]` : lines.slice(i, i + n).join('\n')); i += n - 1; }
-  return truncateTokens(folded.join('\n'), isError ? budget * 3 : budget);
+  for (let i = 0; i < lines.length; i++) { let n = 1; while (i + n < lines.length && lines[i + n] === lines[i]) n++; folded.push(n > 2 && lines[i].trim() ? `${lines[i]}\n[… same line ×${n}]` : lines.slice(i, i + n).join('\n')); i += n - 1; }
+  return truncateTokens(folded.join('\n'), isError ? budget * ERROR_BUDGET_MULTIPLIER : budget);
 }
 
 export function renderSession(file: string, toolResultTokenBudget = 0): { id: string; cwd: string; text: string; rows: string[]; evidence:Evidence[] } {
@@ -158,8 +161,11 @@ export function renderSession(file: string, toolResultTokenBudget = 0): { id: st
         }
       }
     } else if (m.role === "toolResult") {
-      const t = compactToolResult(textOf(m.content, { toolCalls: false }), toolResultTokenBudget, !!m.isError, seenResults, ++resultIndex);
-      const row = `[tool ${m.toolName}${m.isError ? " (error)" : ""}]\n${t}`;
+      // Human replies to request_user_input are user evidence: never compacted, checked on the raw text.
+      const rawText = textOf(m.content, { toolCalls: false });
+      const index = ++resultIndex;
+      const t = questions.has(m.toolCallId) ? rawText : compactToolResult(rawText, toolResultTokenBudget, !!m.isError, seenResults, index);
+      const row = `[tool ${m.toolName}${toolResultTokenBudget > 0 ? ` #${index}` : ""}${m.isError ? " (error)" : ""}]\n${t}`;
       out.push(row);
       let human=false;
       try {const value=JSON.parse(t);human=questions.has(m.toolCallId)&&Object.values(value.answers??{}).some((a:any)=>Array.isArray(a.answers)&&a.answers.some((s:any)=>typeof s==="string"&&s.trim()));}catch{/* ordinary tool output */}

@@ -25,18 +25,19 @@ export function registryRuntime(llm: Llm, model: MemoryModel, request: (model: M
   };
 }
 
+export type SessionUsage = { requests: number; input: number; output: number; cacheRead: number; totalTokens: number };
 export async function runPiConsolidationSession(llm: Llm, model: MemoryModel, cfg: MemoriesConfig, root: string, systemPrompt: string, prompt: string, signal: AbortSignal, guarded: <T>(fn:()=>T)=>T, onProgress?: (s:string)=>void) {
   const progress = (message: string) => { try { onProgress?.(message); } catch { /* Observers must not change tool outcomes. */ } };
   const {createAgentSession,DefaultResourceLoader,SessionManager,SettingsManager}=await import("@earendil-works/pi-coding-agent");
   const settingsManager=SettingsManager.inMemory({compaction:{enabled:true},retry:{enabled:false},packages:[],extensions:[],skills:[],prompts:[],enableAnalytics:false,enableInstallTelemetry:false});
   const resourceLoader=new DefaultResourceLoader({cwd:root,agentDir:root,settingsManager,noExtensions:true,noSkills:true,noPromptTemplates:true,noThemes:true,noContextFiles:true,systemPrompt});
   await resourceLoader.reload();
-  const usage = { requests: 0, input: 0, output: 0, cacheRead: 0, totalTokens: 0 };
+  const usage: SessionUsage = { requests: 0, input: 0, output: 0, cacheRead: 0, totalTokens: 0 };
   const runtime=registryRuntime(llm,model,async(m,context,options)=>{
     if(signal.aborted)throw new Error("aborted");
     guarded(()=>{});
     const response=await llm.registry.complete(m,context,{...options,reasoningEffort:cfg.consolidation_thinking==="off"?undefined:cfg.consolidation_thinking,signal:options?.signal?AbortSignal.any([signal,options.signal]):signal});
-    usage.requests++; usage.input += response.usage?.input ?? 0; usage.output += response.usage?.output ?? 0; usage.cacheRead += response.usage?.cacheRead ?? 0; usage.totalTokens += response.usage?.totalTokens ?? 0;
+    const u = response.usage; usage.requests++; usage.input += u?.input ?? 0; usage.output += u?.output ?? 0; usage.cacheRead += u?.cacheRead ?? 0; usage.totalTokens += u?.totalTokens ?? ((u?.input ?? 0) + (u?.output ?? 0));
     // SDK expects complete pi message metadata; provider responses already contain it.
     return {...response, api:response.api ?? m.api, provider:response.provider ?? m.provider, model:response.model ?? m.id, timestamp:response.timestamp ?? Date.now(),
       usage:Object.assign({input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0},response.usage,{cost:Object.assign({input:0,output:0,cacheRead:0,cacheWrite:0,total:0},response.usage?.cost)})};
@@ -70,5 +71,7 @@ export async function runPiConsolidationSession(llm: Llm, model: MemoryModel, cf
     try { await session.abort(); } catch (e) { abortError = e; }
     finally { session.dispose(); }
     if (abortError) progress('session abort cleanup failed');
+    // Report on every exit path: runaway or failing consolidations are exactly where cost matters.
+    if (usage.requests) progress(`usage requests=${usage.requests} input=${usage.input} cacheRead=${usage.cacheRead} output=${usage.output} total=${usage.totalTokens}`);
   }
 }

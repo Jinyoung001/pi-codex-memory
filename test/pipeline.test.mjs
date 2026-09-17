@@ -10,7 +10,7 @@ import { rolloutSummaryFileStem, syncRolloutSummaries, rebuildRawMemoriesFile, v
 import { prepareMemoryWorkspace, memoryWorkspaceDiff, resetMemoryWorkspaceBaseline, gitAvailable, renderWorkspaceDiffFile } from '../src/workspace.ts';
 import { parseMemoryCitation, extractCitationBlocks, threadIdsFromCitation } from '../src/read-path.ts';
 import { RootJail, consolidationTools } from '../src/agent-tools.ts';
-import { renderSession } from '../src/rollout.ts';
+import { renderSession, ERROR_BUDGET_MULTIPLIER } from '../src/rollout.ts';
 import * as phase2 from '../src/phase2.ts';
 import * as phase1 from '../src/phase1.ts';
 import { DEFAULTS } from '../src/config.ts';
@@ -189,12 +189,27 @@ test('tool result compaction caps, folds repeats, dedups identical results and s
   const raw = renderSession(f), small = renderSession(f, 500);
   assert.doesNotMatch(raw.text, /truncated|identical to|same line/);
   assert.match(small.text, /\[human user\]\nkeep u{6000}/);
-  assert.match(small.text, /\[tool read\]\nline 0 .*…\d+ tokens truncated…/s);
-  assert.match(small.text, /\[tool read\]\n\[identical to tool result #1\]/);
+  assert.match(small.text, /\[tool read #1\]\nline 0 .*…\d+ tokens truncated…/s);
+  assert.match(small.text, /\[tool read #2\]\n\[identical to tool result #1\]/);
   assert.match(small.text, /warning: same\n\[… same line ×50\]/);
-  const err = small.text.split('[tool bash (error)]\n')[1];
-  assert.ok(err.length > 500 * 4 && err.length <= 1500 * 4 + 64, 'error results keep a 3x budget');
+  const err = small.text.split('[tool bash #4 (error)]\n')[1];
+  assert.ok(err.length > 500 * 4 && err.length <= 500 * ERROR_BUDGET_MULTIPLIER * 4 + 64, 'error results keep a larger budget');
   assert.ok(small.text.length < raw.text.length / 3);
+});
+
+test('human replies to request_user_input are never compacted', t => {
+  const f = path.join(tmp(t), 's.jsonl');
+  const reply = JSON.stringify({ answers: { q: { answers: ['yes, ' + 'detail '.repeat(400)] } } });
+  const lines = [
+    { type: 'session', version: 3, id: 'sid', timestamp: 't', cwd: 'C:/p' },
+    { type: 'message', id: 'a1', parentId: null, message: { role: 'assistant', content: [{ type: 'toolCall', id: 'q1', name: 'request_user_input', arguments: { q: 'ok?' } }] } },
+    { type: 'message', id: 'r1', parentId: 'a1', message: { role: 'toolResult', toolName: 'request_user_input', toolCallId: 'q1', content: [{ type: 'text', text: reply }] } },
+    { type: 'message', id: 'r2', parentId: 'r1', message: { role: 'toolResult', toolName: 'request_user_input', toolCallId: 'other', content: [{ type: 'text', text: reply }] } },
+  ];
+  fs.writeFileSync(f, lines.map(l => JSON.stringify(l)).join('\n') + '\n');
+  const r = renderSession(f, 100);
+  assert.ok(r.rows.some(row => row.startsWith('[human user]\nAssistant question:') && row.endsWith('Human reply: ' + reply)));
+  assert.doesNotMatch(r.rows.find(row => row.startsWith('[human user]')), /truncated|identical/);
 });
 
 // ---- end-to-end with a fake model (no network) ----

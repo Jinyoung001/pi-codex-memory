@@ -96,7 +96,7 @@ function validateConfig(raw: Record<string, unknown>): MemoriesConfig {
   cfg.max_unused_days = Math.min(365, Math.max(0, cfg.max_unused_days));
   cfg.max_rollout_age_days = Math.min(90, Math.max(0, cfg.max_rollout_age_days));
   cfg.min_rollout_idle_hours = Math.min(48, Math.max(1, cfg.min_rollout_idle_hours));
-  if (!Number.isSafeInteger(cfg.tool_result_token_budget) || cfg.tool_result_token_budget < 0) throw new Error('tool_result_token_budget must be a non-negative integer');
+  if (cfg.tool_result_token_budget < 0) throw new Error("tool_result_token_budget must be a non-negative integer");
   const efforts = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
   if (!efforts.includes(cfg.extract_thinking) || !efforts.includes(cfg.consolidation_thinking)) throw new Error("invalid memory reasoning effort");
   cfg.max_raw_memories_for_consolidation = Math.min(4096, Math.max(1, cfg.max_raw_memories_for_consolidation));

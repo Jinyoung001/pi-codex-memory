@@ -1,3 +1,5 @@
+**English** | [한국어](README.ko.md) | [日本語](README.ja.md) | [简体中文](README.zh-CN.md)
+
 # pi-codex-memory
 
 A standalone pi extension porting the memory behavior of [OpenAI Codex](https://github.com/openai/codex/tree/5bf132cd527311eb61bbec46562e3890eb49df80/codex-rs/memories), pinned to commit `5bf132cd527311eb61bbec46562e3890eb49df80`. Uses pi sessions, model registry and authentication; no Codex installation or account is required. Host differences and verification: [CODEX_PARITY.md](CODEX_PARITY.md).
